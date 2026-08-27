@@ -1358,14 +1358,13 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
 
         for(int i = 0; i < warmup; i++)
             (void)profile_period_batch_cuda_ms(
-                g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound, ev);
+                g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound,
+                ev[0], ev[1]);
 
-        for(int i = 0; i < runs; i++){
-            PeriodBatchCudaMs t = profile_period_batch_cuda_ms(
-                g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound, ev);
-            cuda_ms_sum += t.cuda_ms;
-            wall_sum += t.wall_ms;
-        }
+        for(int i = 0; i < runs; i++)
+            wall_sum += profile_period_batch_cuda_ms(
+                g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound,
+                ev[0], ev[1]);
     }
 
     /*
