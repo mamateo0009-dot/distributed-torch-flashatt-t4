@@ -1554,8 +1554,10 @@ static int gpu_scan_device_period(
             double scan_mac_s = cp_pp_mac_rate_from_tiles(tiles_scanned, scan_sec);
             char mac_buf[32];
             cp_pp_fmt_mac_rate(scan_mac_s, mac_buf, sizeof(mac_buf));
+            int rpb_total = g_row_period_batch * g_ngpu;
+            if(rpi0 + rpb_total > row_periods) rpb_total = row_periods - rpi0;
             printf("[gpu] plain_proof progress: row periods %d/%d tiles %llu/%d (%.1f%%) %s\n",
-                   rpi0 + row_batch, row_periods,
+                   rpi0 + rpb_total, row_periods,
                    (unsigned long long)tiles_scanned, total_tiles,
                    100.0 * (double)tiles_scanned / (double)total_tiles, mac_buf);
             fflush(stdout);
@@ -1660,8 +1662,10 @@ static int gpu_scan_device(
             double scan_mac_s = cp_pp_mac_rate_from_tiles(tiles_scanned, scan_sec);
             char mac_buf[32];
             cp_pp_fmt_mac_rate(scan_mac_s, mac_buf, sizeof(mac_buf));
+            int rpb_total = batch * g_ngpu;
+            if(rp0 + rpb_total > row_parts) rpb_total = row_parts - rp0;
             printf("[gpu] plain_proof progress: row parts %d/%d tiles %llu/%d (%.1f%%) %s\n",
-                   rp0 + rpb, row_parts,
+                   rp0 + rpb_total, row_parts,
                    (unsigned long long)tiles_scanned, total_tiles,
                    100.0 * (double)tiles_scanned / (double)total_tiles, mac_buf);
             fflush(stdout);
