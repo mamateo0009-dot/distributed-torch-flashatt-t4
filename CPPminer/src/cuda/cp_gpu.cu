@@ -73,6 +73,7 @@ typedef struct {
 #endif
     int       use_cublas_period;
     int       use_cutlass_fused;
+    cudaStream_t stream;
 } GpuCtx;
 
 static GpuCtx g_gpus[MAX_GPUS];
@@ -1089,7 +1090,7 @@ static PeriodBatchTimes profile_period_batch_timed(
     } else {
         CU_CHECK(cudaEventRecord(ev[0]));
         gpu_period_gemm_batch(
-            g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, bound);
+            g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, bound, nullptr);
         CU_CHECK(cudaEventRecord(ev[1]));
         CU_CHECK(cudaEventSynchronize(ev[1]));
         CU_CHECK(cudaEventElapsedTime(&t.gemm_ex_ms, ev[0], ev[1]));
@@ -1124,7 +1125,7 @@ static float profile_period_batch_cuda_ms(
 {
     CU_CHECK(cudaEventRecord(e0));
     gpu_period_gemm_batch(
-        g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, bound);
+        g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, bound, nullptr);
     launch_jackpot_batch(
         g, row_batch_count, col_batch_count, rpi0, cpi0, m, n, bound);
     for(int i = 0; i < g_ngpu; i++){
@@ -1410,7 +1411,7 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaEventRecord(batch_tm.batch_start));
 
-                gpu_period_gemm_batch(g, m, n, rpi0, cpi0, rb, cb, bound);
+                gpu_period_gemm_batch(g, m, n, rpi0, cpi0, rb, cb, bound, nullptr);
                 launch_jackpot_batch(g, rb, cb, rpi0, cpi0, m, n, bound);
 
                 CU_CHECK(cudaEventRecord(batch_tm.post_launch));
