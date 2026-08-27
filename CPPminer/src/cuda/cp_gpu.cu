@@ -1321,7 +1321,7 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
     ensure_buffers(g, m, n);
     CU_CHECK(cudaSetDevice(g->dev));
     scan_profile_ensure_events(ev);
-
+    const char* gemm_mode = NULL;
     prep_t0 = cp_now_sec();
     if(gpu_prepare_noisy_matrices(g, cp_gpu_fresh_rng_seed(), job_key, m, n, a_key) != 0)
         goto done;
@@ -1337,33 +1337,36 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
         CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
     }
 
-    const char* gemm_mode = g->use_cutlass_fused ? "CUTLASS fused GEMM"
-                            : (g->use_cublas_period ? "cuBLAS int8 fat"
-                                                    : "CUDA period GEMM");
-    const int rpi0 = 0;
-    const int cpi0 = 0;
+    gemm_mode = g->use_cutlass_fused ? "CUTLASS fused GEMM"
+                : (g->use_cublas_period ? "cuBLAS int8 fat"
+                                        : "CUDA period GEMM");
+    {
+        const int rpi0 = 0;
+        const int cpi0 = 0;
 
-    for(int i = 0; i < warmup; i++)
-        (void)profile_period_batch_timed(
-            g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound, ev);
+        for(int i = 0; i < warmup; i++)
+            (void)profile_period_batch_timed(
+                g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound, ev);
 
-    for(int i = 0; i < runs; i++){
-        PeriodBatchTimes t = profile_period_batch_timed(
-            g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound, ev);
-        gemm_ex_sum += t.gemm_ex_ms;
-        jackpot_sum += t.jackpot_ms;
-        sync_sum += t.sync_ms;
+        for(int i = 0; i < runs; i++){
+            PeriodBatchTimes t = profile_period_batch_timed(
+                g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound, ev);
+            gemm_ex_sum += t.gemm_ex_ms;
+            jackpot_sum += t.jackpot_ms;
+            sync_sum += t.sync_ms;
+        }
+
+        for(int i = 0; i < warmup; i++)
+            (void)profile_period_batch_cuda_ms(
+                g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound, ev);
+
+        for(int i = 0; i < runs; i++){
+            PeriodBatchCudaMs t = profile_period_batch_cuda_ms(
+                g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound, ev);
+            cuda_ms_sum += t.cuda_ms;
+            wall_sum += t.wall_ms;
+        }
     }
-
-    for(int i = 0; i < warmup; i++)
-        (void)profile_period_batch_cuda_ms(
-            g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound,
-            ev[0], ev[1]);
-
-    for(int i = 0; i < runs; i++)
-        wall_sum += profile_period_batch_cuda_ms(
-            g, rpi0, cpi0, row_batch_count, col_batch_count, m, n, bound,
-            ev[0], ev[1]);
 
     /*
      * Full-scan sweep: identical loop shape to gpu_scan_device_period
