@@ -1518,6 +1518,8 @@ static int gpu_scan_device_period(
                 current_batch_tiles += pp_batch_hash_tiles(row_batch, col_batch);
 
                 GpuCtx* g = &g_gpus[i];
+                printf("[gpu] Launching GPU %d for rpi=%d cpi=%d row_batch=%d\n", g->dev, rpi, cpi0, row_batch);
+                fflush(stdout);
                 CU_CHECK(cudaSetDevice(g->dev));
                 gpu_period_gemm_batch(
                     g, m, n, rpi, cpi0, row_batch, col_batch, bound);
