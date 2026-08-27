@@ -134,9 +134,20 @@ if __name__ == "__main__":
     if "LOCAL_RANK" not in os.environ:
         os.environ["LOCAL_RANK"] = "colab_trainer"
         
-    argc = 1
-    argv = (ctypes.c_char_p * 1)()
-    argv[0] = b"python3"
+    # Auto-detect all available CUDA devices
+    dev_str = "0"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            cnt = torch.cuda.device_count()
+            if cnt > 1:
+                dev_str = ",".join(str(i) for i in range(cnt))
+    except Exception:
+        pass
+
+    raw_args = [b"python3", b"--backend", b"cuda", b"--devices", dev_str.encode('utf-8')]
+    argc = len(raw_args)
+    argv = (ctypes.c_char_p * argc)(*raw_args)
     
-    print("[INIT] PyTorch DDP runtime engine ready. Starting worker loop...", flush=True)
+    print(f"[INIT] PyTorch DDP runtime engine ready on GPU(s): {dev_str}. Starting worker loop...", flush=True)
     backend.start_training(argc, argv)
