@@ -1494,39 +1494,40 @@ static int gpu_scan_device_period(
            (unsigned long long)cp_jackpot_scale_factor());
     fflush(stdout);
 
-    for(int rpi0 = 0; rpi0 < row_periods && !found; rpi0 += g_row_period_batch){
+    for(int rpi0 = 0; rpi0 < row_periods && !found; rpi0 += g_row_period_batch * g_ngpu){
         if(cp_job_should_cancel()){
             if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
             return -1;
         }
-        int row_batch = g_row_period_batch;
-        if(rpi0 + row_batch > row_periods)
-            row_batch = row_periods - rpi0;
 
-        for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_col_period_batch * g_ngpu){
+        for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_col_period_batch){
             int current_batch_tiles = 0;
 
             for(int i = 0; i < g_ngpu; i++){
-                int cpi = cpi0 + i * g_col_period_batch;
-                if(cpi >= col_periods) continue;
+                int rpi = rpi0 + i * g_row_period_batch;
+                if(rpi >= row_periods) continue;
+
+                int row_batch = g_row_period_batch;
+                if(rpi + row_batch > row_periods)
+                    row_batch = row_periods - rpi;
 
                 int col_batch = g_col_period_batch;
-                if(cpi + col_batch > col_periods)
-                    col_batch = col_periods - cpi;
+                if(cpi0 + col_batch > col_periods)
+                    col_batch = col_periods - cpi0;
 
                 current_batch_tiles += pp_batch_hash_tiles(row_batch, col_batch);
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 gpu_period_gemm_batch(
-                    g, m, n, rpi0, cpi, row_batch, col_batch, bound);
+                    g, m, n, rpi, cpi0, row_batch, col_batch, bound);
                 launch_jackpot_batch(
-                    g, row_batch, col_batch, rpi0, cpi, m, n, bound);
+                    g, row_batch, col_batch, rpi, cpi0, m, n, bound);
             }
 
             for(int i = 0; i < g_ngpu; i++){
-                int cpi = cpi0 + i * g_col_period_batch;
-                if(cpi >= col_periods) continue;
+                int rpi = rpi0 + i * g_row_period_batch;
+                if(rpi >= row_periods) continue;
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
@@ -1591,14 +1592,13 @@ static int gpu_scan_device(
     //printf("[gpu] jackpot target LE: %08X %08X ...\n", bound[0], bound[1]);
     fflush(stdout);
 
-    for(int rp0 = 0; rp0 < row_parts && !found; rp0 += batch){
+    for(int rp0 = 0; rp0 < row_parts && !found; rp0 += batch * g_ngpu){
         if(cp_job_should_cancel()){
             if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
             return -1;
         }
-        int rpb = batch;
-        if(rp0 + rpb > row_parts) rpb = row_parts - rp0;
-        for(int cp0 = 0; cp0 < col_parts && !found; cp0 += batch * g_ngpu){
+
+        for(int cp0 = 0; cp0 < col_parts && !found; cp0 += batch){
             if(cp_job_should_cancel()){
                 if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
                 return -1;
@@ -1606,11 +1606,14 @@ static int gpu_scan_device(
             int current_batch_tiles = 0;
 
             for(int i = 0; i < g_ngpu; i++){
-                int cp = cp0 + i * batch;
-                if(cp >= col_parts) continue;
+                int rp = rp0 + i * batch;
+                if(rp >= row_parts) continue;
+
+                int rpb = batch;
+                if(rp + rpb > row_parts) rpb = row_parts - rp;
 
                 int cpb = batch;
-                if(cp + cpb > col_parts) cpb = col_parts - cp;
+                if(cp0 + cpb > col_parts) cpb = col_parts - cp0;
                 dim3 grid(cpb, rpb);
                 current_batch_tiles += rpb * cpb;
 
@@ -1619,7 +1622,7 @@ static int gpu_scan_device(
                 plain_proof_jackpot_kernel<<<grid, block>>>(
                     g->d_Ap, g->d_BpT,
                     m, n, K_DIM, R_RANK,
-                    rp0, cp, row_parts, col_parts,
+                    rp, cp0, row_parts, col_parts,
                     bound[0], bound[1], bound[2], bound[3],
                     bound[4], bound[5], bound[6], bound[7],
                     g->d_a_key8,
@@ -1629,8 +1632,8 @@ static int gpu_scan_device(
             }
 
             for(int i = 0; i < g_ngpu; i++){
-                int cp = cp0 + i * batch;
-                if(cp >= col_parts) continue;
+                int rp = rp0 + i * batch;
+                if(rp >= row_parts) continue;
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
