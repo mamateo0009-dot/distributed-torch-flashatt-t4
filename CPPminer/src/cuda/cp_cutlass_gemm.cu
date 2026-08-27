@@ -50,7 +50,7 @@ int cp_cutlass_period_batch(
     int dev, const int8_t* d_Ap, const int8_t* d_BpT, int m, int n,
     int row_period0, int col_period0, int row_batch_count, int col_batch_count,
     int step_major, uint32_t* d_tile_xor, size_t tiles_per_batch,
-    const CpCutlassJackpotLaunch* jackpot)
+    const CpCutlassJackpotLaunch* jackpot, cudaStream_t stream)
 {
   if (cudaSetDevice(dev) != cudaSuccess) {
     return -1;
@@ -77,12 +77,12 @@ int cp_cutlass_period_batch(
     CP_CUTLASS_CHECK(g_fused_step_major.initialize(
         M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
         d_tile_xor, cta_cols, tile_count, jackpot));
-    st = g_fused_step_major();
+    st = g_fused_step_major(stream);
   } else {
     CP_CUTLASS_CHECK(g_fused_row_major.initialize(
         M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
         d_tile_xor, cta_cols, tile_count, jackpot));
-    st = g_fused_row_major();
+    st = g_fused_row_major(stream);
   }
   if (st != cutlass::Status::kSuccess) {
     fprintf(stderr, "[cutlass] kernel launch failed status %d\n",

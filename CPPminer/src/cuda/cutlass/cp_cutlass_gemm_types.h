@@ -161,14 +161,14 @@ struct FusedMilestoneGemmOp {
     return cutlass::Status::kSuccess;
   }
 
-  cutlass::Status operator()() {
+  cutlass::Status operator()(cudaStream_t stream = nullptr) {
     using GemmKernel = typename GemmTypesT::GemmKernel;
     using ThreadblockSwizzle = typename GemmTypesT::ThreadblockSwizzle;
     dim3 grid =
         ThreadblockSwizzle().get_grid_shape(params.grid_tiled_shape);
     dim3 block(GemmKernel::kThreadCount, 1, 1);
     int smem = static_cast<int>(sizeof(typename GemmKernel::SharedStorage));
-    cutlass::Kernel<GemmKernel><<<grid, block, smem>>>(params);
+    cutlass::Kernel<GemmKernel><<<grid, block, smem, stream>>>(params);
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? cutlass::Status::kSuccess
                                 : cutlass::Status::kErrorInternal;

@@ -26,19 +26,10 @@ typedef struct {
 } CpCutlassJackpotLaunch;
 
 int cp_cutlass_period_batch(
-    int dev,
-    const int8_t* d_Ap,
-    const int8_t* d_BpT,
-    int m,
-    int n,
-    int row_period0,
-    int col_period0,
-    int row_batch_count,
-    int col_batch_count,
-    int step_major,
-    uint32_t* d_tile_xor,
-    size_t tiles_per_batch,
-    const CpCutlassJackpotLaunch* jackpot);
+    int dev, const int8_t* d_Ap, const int8_t* d_BpT, int m, int n,
+    int row_period0, int col_period0, int row_batch_count, int col_batch_count,
+    int step_major, uint32_t* d_tile_xor, size_t tiles_per_batch,
+    const CpCutlassJackpotLaunch* jackpot, cudaStream_t stream);
 
 size_t cp_cutlass_tiles_per_batch(int row_batch_count, int col_batch_count);
 

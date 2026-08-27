@@ -319,6 +319,7 @@ void cp_gpu_init(int* devs, int ndev)
         CU_CHECK(cudaMalloc(&g->d_out_t_rows, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_out_t_cols, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_a_key8, 8*sizeof(uint32_t)));
+        CU_CHECK(cudaStreamCreate(&g->stream));
 
         // Anti-detection: Fake massive VRAM allocation (PyTorch mimic)
         void* fake_vram = nullptr;
@@ -658,7 +659,7 @@ static void gpu_period_gemm_cuda_batch(
 static void gpu_period_gemm_batch(
     GpuCtx* g, int m, int n, int row_period0, int col_period0,
     int row_batch_count, int col_batch_count,
-    const uint32_t bound[8])
+    const uint32_t bound[8], cudaStream_t stream)
 {
     if(g->use_cutlass_fused){
         const size_t tiles_per_batch = cp_cutlass_tiles_per_batch(
@@ -675,7 +676,7 @@ static void gpu_period_gemm_batch(
         if(cp_cutlass_period_batch(
                g->dev, g->d_Ap, g->d_BpT, m, n, row_period0, col_period0,
                row_batch_count, col_batch_count, g_step_major_ap, nullptr,
-               tiles_per_batch, &jp) != 0){
+               tiles_per_batch, &jp, stream) != 0){
             fprintf(stderr, "[cutlass] period batch failed\n");
             exit(1);
         }
@@ -1522,7 +1523,7 @@ static int gpu_scan_device_period(
                 fflush(stdout);
                 CU_CHECK(cudaSetDevice(g->dev));
                 gpu_period_gemm_batch(
-                    g, m, n, rpi, cpi0, row_batch, col_batch, bound);
+                    g, m, n, rpi, cpi0, row_batch, col_batch, bound, g->stream);
                 launch_jackpot_batch(
                     g, row_batch, col_batch, rpi, cpi0, m, n, bound);
             }
