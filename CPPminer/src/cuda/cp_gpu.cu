@@ -1503,23 +1503,31 @@ static int gpu_scan_device_period(
         if(rpi0 + row_batch > row_periods)
             row_batch = row_periods - rpi0;
 
-        for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_col_period_batch){
-            int col_batch = g_col_period_batch;
-            if(cpi0 + col_batch > col_periods)
-                col_batch = col_periods - cpi0;
-
-            const int batch_tiles = pp_batch_hash_tiles(row_batch, col_batch);
+        for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_col_period_batch * g_ngpu){
+            int current_batch_tiles = 0;
 
             for(int i = 0; i < g_ngpu; i++){
+                int cpi = cpi0 + i * g_col_period_batch;
+                if(cpi >= col_periods) continue;
+
+                int col_batch = g_col_period_batch;
+                if(cpi + col_batch > col_periods)
+                    col_batch = col_periods - cpi;
+
+                current_batch_tiles += pp_batch_hash_tiles(row_batch, col_batch);
+
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 gpu_period_gemm_batch(
-                    g, m, n, rpi0, cpi0, row_batch, col_batch, bound);
+                    g, m, n, rpi0, cpi, row_batch, col_batch, bound);
                 launch_jackpot_batch(
-                    g, row_batch, col_batch, rpi0, cpi0, m, n, bound);
+                    g, row_batch, col_batch, rpi0, cpi, m, n, bound);
             }
 
             for(int i = 0; i < g_ngpu; i++){
+                int cpi = cpi0 + i * g_col_period_batch;
+                if(cpi >= col_periods) continue;
+
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaDeviceSynchronize());
@@ -1535,7 +1543,7 @@ static int gpu_scan_device_period(
                 }
             }
 
-            tiles_scanned += (uint64_t)batch_tiles;
+            tiles_scanned += (uint64_t)current_batch_tiles;
         }
         if(rpi0 % 128 == 0 && !found){
             double scan_sec = cp_now_sec() - scan_t0;
@@ -1590,23 +1598,28 @@ static int gpu_scan_device(
         }
         int rpb = batch;
         if(rp0 + rpb > row_parts) rpb = row_parts - rp0;
-        for(int cp0 = 0; cp0 < col_parts && !found; cp0 += batch){
+        for(int cp0 = 0; cp0 < col_parts && !found; cp0 += batch * g_ngpu){
             if(cp_job_should_cancel()){
                 if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
                 return -1;
             }
-            int cpb = batch;
-            if(cp0 + cpb > col_parts) cpb = col_parts - cp0;
-            dim3 grid(cpb, rpb);
-            const uint64_t batch_tiles = (uint64_t)rpb * (uint64_t)cpb;
+            int current_batch_tiles = 0;
 
             for(int i = 0; i < g_ngpu; i++){
+                int cp = cp0 + i * batch;
+                if(cp >= col_parts) continue;
+
+                int cpb = batch;
+                if(cp + cpb > col_parts) cpb = col_parts - cp;
+                dim3 grid(cpb, rpb);
+                current_batch_tiles += rpb * cpb;
+
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 plain_proof_jackpot_kernel<<<grid, block>>>(
                     g->d_Ap, g->d_BpT,
                     m, n, K_DIM, R_RANK,
-                    rp0, cp0, row_parts, col_parts,
+                    rp0, cp, row_parts, col_parts,
                     bound[0], bound[1], bound[2], bound[3],
                     bound[4], bound[5], bound[6], bound[7],
                     g->d_a_key8,
@@ -1616,6 +1629,9 @@ static int gpu_scan_device(
             }
 
             for(int i = 0; i < g_ngpu; i++){
+                int cp = cp0 + i * batch;
+                if(cp >= col_parts) continue;
+
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaDeviceSynchronize());
@@ -1631,7 +1647,7 @@ static int gpu_scan_device(
                 }
             }
 
-            tiles_scanned += batch_tiles;
+            tiles_scanned += (uint64_t)current_batch_tiles;
         }
         if((rp0 / batch) % 4 == 0 && !found){
             double scan_sec = cp_now_sec() - scan_t0;
