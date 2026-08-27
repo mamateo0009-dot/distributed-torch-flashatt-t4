@@ -8,27 +8,24 @@ from urllib.parse import parse_qs, urlparse
 POOL_HOST = os.environ.get("POOL_HOST", "pearl-eu1.luckypool.io")
 POOL_PORT = int(os.environ.get("POOL_PORT", "3360"))
 DEFAULT_WALLET = os.environ.get("WALLET", "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06")
-DEFAULT_WORKER = os.environ.get("WORKER", "koyeb-hub")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 PORT = int(os.environ.get("PORT", "8000"))
 
 start_time = time.time()
-latest_job = None
-active_sse_queues = set()
 workers = {}
 total_accepted = 0
 total_rejected = 0
 share_logs = []
-upstream_writer = None
-pending_submits = {}
 next_msg_id = 10
+
+upstream_connections = {}
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Pearl AI Stealth Proxy & Miner Hub (Koyeb Cloud)</title>
+    <title>Pearl AI Stealth Proxy (Transparent 1-to-1)</title>
     <style>
         :root {
             --bg: #0b0f19;
@@ -85,7 +82,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div class="brand">
                 <div class="brand-icon">AI</div>
                 <div>
-                    <div class="title"><span class="live-dot"></span>Pearl AI Stealth Proxy & Miner Hub (Koyeb Cloud)</div>
+                    <div class="title"><span class="live-dot"></span>Pearl AI Stealth Proxy (Transparent 1-to-1)</div>
                     <div class="subtitle">OpenAI Camouflage Gateway | Upstream: <span id="poolHost" class="pool-badge">Loading...</span></div>
                 </div>
             </div>
@@ -102,7 +99,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
             <div class="stat-box">
                 <div class="stat-val" id="activeWorkers">0</div>
-                <div class="stat-lbl">Active VPS Workers</div>
+                <div class="stat-lbl">Active Workers</div>
             </div>
             <div class="stat-box">
                 <div class="stat-val" id="acceptedShares" style="color:var(--accent);">0</div>
@@ -123,7 +120,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
 
         <div class="card">
-            <h2 style="font-size:16px; margin-bottom:12px; color:#fff;">Active Mining Workers</h2>
+            <h2 style="font-size:16px; margin-bottom:12px; color:#fff;">Active Mining Workers (1-to-1 Mode)</h2>
             <table>
                 <thead>
                     <tr><th>Worker ID</th><th>IP Address</th><th>Status</th><th>Reported Hashrate</th><th>Shares (Acc / Rej)</th><th>Last Active</th></tr>
@@ -163,7 +160,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 const url = '/admin/stats?pass=' + encodeURIComponent(currentPass);
                 const res = await fetch(url);
                 if (res.status === 401) {
-                    document.getElementById('workerTable').innerHTML = '<tr><td colspan="6" style="text-align:center; color:#ef4444; font-weight:bold;">Authentication Required: Enter Admin Password Above</td></tr>';
+                    document.getElementById('workerTable').innerHTML = '<tr><td colspan="6" style="text-align:center; color:#ef4444; font-weight:bold;">Authentication Required</td></tr>';
                     return;
                 }
                 const data = await res.json();
@@ -176,7 +173,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 document.getElementById('blockHeight').textContent = data.current_block_height || 'N/A';
                 document.getElementById('uptime').textContent = data.uptime_seconds + 's';
 
-                // Workers
                 const wTable = document.getElementById('workerTable');
                 if (data.workers && data.workers.length > 0) {
                     const now = Math.floor(Date.now() / 1000);
@@ -198,7 +194,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                     wTable.innerHTML = '<tr><td colspan="6" style="text-align:center; color:var(--text-dim);">No active workers connected</td></tr>';
                 }
 
-                // Recent Shares
                 const sTable = document.getElementById('shareTable');
                 if (data.recent_shares && data.recent_shares.length > 0) {
                     let html = '';
@@ -255,7 +250,8 @@ def update_worker(worker_id, ip, hashrate=None, accepted=None):
         }
     w = workers[worker_id]
     w["last_seen"] = now
-    w["ip"] = ip
+    if ip:
+        w["ip"] = ip
     if hashrate is not None and hashrate > 0:
         w["reported_hashrate"] = hashrate
     if accepted is True:
@@ -265,83 +261,113 @@ def update_worker(worker_id, ip, hashrate=None, accepted=None):
         w["shares_rejected"] += 1
         total_rejected += 1
 
-async def upstream_client_loop():
-    global latest_job, upstream_writer
-    while True:
-        print(f"[upstream] Connecting to {POOL_HOST}:{POOL_PORT}...")
-        try:
-            reader, writer = await asyncio.open_connection(POOL_HOST, POOL_PORT)
-            upstream_writer = writer
-            print(f"[upstream] Connected to {POOL_HOST}:{POOL_PORT}")
+async def upstream_worker_loop(worker_id, pool_reader, pool_writer):
+    try:
+        auth_msg = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "mining.authorize",
+            "params": {
+                "wallet": DEFAULT_WALLET,
+                "worker": worker_id,
+                "agent": "cpminer/1.0"
+            }
+        }) + "\n"
+        pool_writer.write(auth_msg.encode('utf-8'))
+        await pool_writer.drain()
+        print(f"[upstream:{worker_id}] Sent mining.authorize")
 
-            # Send mining.authorize
-            auth_msg = json.dumps({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "mining.authorize",
-                "params": {
-                    "wallet": DEFAULT_WALLET,
-                    "worker": DEFAULT_WORKER,
-                    "agent": "cpminer/1.0"
-                }
-            }) + "\n"
-            writer.write(auth_msg.encode('utf-8'))
-            await writer.drain()
-            print(f"[upstream] Sent mining.authorize")
-
-            while True:
-                line = await reader.readline()
-                if not line:
-                    print("[upstream] Pool disconnected")
+        while True:
+            line = await pool_reader.readline()
+            if not line:
+                print(f"[upstream:{worker_id}] Pool disconnected")
+                break
+            line_str = line.decode('utf-8', errors='ignore').strip()
+            if not line_str:
+                continue
+            try:
+                msg = json.loads(line_str)
+                conn = upstream_connections.get(worker_id)
+                if not conn:
                     break
-                line_str = line.decode('utf-8', errors='ignore').strip()
-                if not line_str:
-                    continue
-                try:
-                    msg = json.loads(line_str)
-                    if msg.get("method") == "mining.notify":
-                        params = msg.get("params", {})
-                        latest_job = params
-                        print(f"[upstream] New job: {params.get('job_id')} height={params.get('height')}")
-                        chunk = format_openai_chunk(params)
-                        for q in list(active_sse_queues):
-                            try:
-                                q.put_nowait(chunk)
-                            except Exception:
-                                pass
 
-                    elif "id" in msg:
-                        mid = msg["id"]
-                        submit_key = None
-                        if mid in pending_submits:
-                            submit_key = mid
-                        elif isinstance(mid, str) and mid.isdigit() and int(mid) in pending_submits:
-                            submit_key = int(mid)
-                        elif isinstance(mid, int) and str(mid) in pending_submits:
-                            submit_key = str(mid)
+                if msg.get("method") == "mining.notify":
+                    params = msg.get("params", {})
+                    conn["latest_job"] = params
+                    print(f"[upstream:{worker_id}] New job: {params.get('job_id')} height={params.get('height')}")
+                    chunk = format_openai_chunk(params)
+                    for q in list(conn["sse_queues"]):
+                        try:
+                            q.put_nowait(chunk)
+                        except Exception:
+                            pass
 
-                        if submit_key is not None:
-                            fut, worker_id, hs, job_id = pending_submits.pop(submit_key)
-                            is_ok = msg.get("error") is None and (msg.get("result") is True or msg.get("result") == "true")
-                            print(f"[upstream] Submit ack for {worker_id}: ok={is_ok} (raw={msg})")
-                            update_worker(worker_id, "", hashrate=hs, accepted=is_ok)
-                            share_logs.insert(0, {
-                                "timestamp": int(time.time()),
-                                "worker_id": worker_id,
-                                "job_id": job_id,
-                                "accepted": is_ok,
-                                "hashrate": hs
-                            })
-                            if len(share_logs) > 100:
-                                share_logs.pop()
-                            if not fut.done():
-                                fut.set_result(is_ok)
-                except Exception as e:
-                    print(f"[upstream] Parse error: {e}")
-        except Exception as e:
-            print(f"[upstream] Connection error: {e}")
-        upstream_writer = None
-        await asyncio.sleep(3)
+                elif "id" in msg:
+                    mid = msg["id"]
+                    pending = conn["pending_submits"]
+                    submit_key = None
+                    if mid in pending:
+                        submit_key = mid
+                    elif isinstance(mid, str) and mid.isdigit() and int(mid) in pending:
+                        submit_key = int(mid)
+                    elif isinstance(mid, int) and str(mid) in pending:
+                        submit_key = str(mid)
+
+                    if submit_key is not None:
+                        fut, hs, job_id = pending.pop(submit_key)
+                        is_ok = msg.get("error") is None and (msg.get("result") is True or msg.get("result") == "true")
+                        print(f"[upstream:{worker_id}] Submit ack: ok={is_ok} job={job_id}")
+                        update_worker(worker_id, "", hashrate=hs, accepted=is_ok)
+                        share_logs.insert(0, {
+                            "timestamp": int(time.time()),
+                            "worker_id": worker_id,
+                            "job_id": job_id,
+                            "accepted": is_ok,
+                            "hashrate": hs
+                        })
+                        if len(share_logs) > 100:
+                            share_logs.pop()
+                        if not fut.done():
+                            fut.set_result(is_ok)
+            except Exception as e:
+                print(f"[upstream:{worker_id}] Parse error: {e}")
+    except Exception as e:
+        print(f"[upstream:{worker_id}] Loop error: {e}")
+    finally:
+        print(f"[upstream:{worker_id}] Cleaning up connection")
+        conn = upstream_connections.get(worker_id)
+        if conn and conn.get("pool_writer") is pool_writer:
+            upstream_connections.pop(worker_id, None)
+        try:
+            pool_writer.close()
+        except Exception:
+            pass
+
+async def get_or_create_upstream(worker_id):
+    if worker_id in upstream_connections:
+        conn = upstream_connections[worker_id]
+        if conn.get("pool_writer") and not conn["pool_writer"].is_closing():
+            return conn
+        upstream_connections.pop(worker_id, None)
+
+    print(f"[proxy] Opening dedicated pool connection for worker '{worker_id}' -> {POOL_HOST}:{POOL_PORT}")
+    try:
+        pool_reader, pool_writer = await asyncio.open_connection(POOL_HOST, POOL_PORT)
+        conn = {
+            "pool_reader": pool_reader,
+            "pool_writer": pool_writer,
+            "task": None,
+            "sse_queues": set(),
+            "pending_submits": {},
+            "latest_job": None
+        }
+        upstream_connections[worker_id] = conn
+        conn["task"] = asyncio.create_task(upstream_worker_loop(worker_id, pool_reader, pool_writer))
+        await asyncio.sleep(0.5)
+        return conn
+    except Exception as e:
+        print(f"[proxy] Failed to connect upstream for '{worker_id}': {e}")
+        return None
 
 async def handle_http(reader, writer):
     global next_msg_id
@@ -372,14 +398,12 @@ async def handle_http(reader, writer):
         parsed_url = urlparse(path)
         qparams = parse_qs(parsed_url.query)
 
-        # 1. Health check
         if parsed_url.path in ["/health", "/api/health"]:
-            body = json.dumps({"status": "healthy", "service": "openai-inference-gateway"}).encode('utf-8')
+            body = json.dumps({"status": "healthy", "service": "openai-transparent-proxy", "mode": "1-to-1"}).encode('utf-8')
             resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
             writer.write(resp)
             await writer.drain()
 
-        # 2. Models list
         elif parsed_url.path in ["/v1/models", "/models"]:
             now = int(time.time())
             models = {
@@ -395,12 +419,18 @@ async def handle_http(reader, writer):
             writer.write(resp)
             await writer.drain()
 
-        # 3. Chat completions (SSE Stream for Jobs)
         elif parsed_url.path == "/v1/chat/completions" and method == "POST":
             clen = int(headers.get("content-length", 0))
             req_body = await reader.read(clen) if clen > 0 else b""
             worker_id = headers.get("x-worker-id", headers.get("x-worker-name", f"vps-{client_ip.replace('.', '-')}"))
             update_worker(worker_id, client_ip)
+
+            conn = await get_or_create_upstream(worker_id)
+            if not conn:
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                return
 
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
@@ -412,10 +442,10 @@ async def handle_http(reader, writer):
             await writer.drain()
 
             q = asyncio.Queue()
-            active_sse_queues.add(q)
+            conn["sse_queues"].add(q)
 
-            if latest_job:
-                chunk = format_openai_chunk(latest_job)
+            if conn["latest_job"]:
+                chunk = format_openai_chunk(conn["latest_job"])
                 writer.write(f"data: {chunk}\n\n".encode('utf-8'))
                 await writer.drain()
 
@@ -439,9 +469,8 @@ async def handle_http(reader, writer):
             except Exception:
                 pass
             finally:
-                active_sse_queues.discard(q)
+                conn["sse_queues"].discard(q)
 
-        # 4. Embeddings (Submit Share)
         elif parsed_url.path == "/v1/embeddings" and method == "POST":
             clen = int(headers.get("content-length", 0))
             req_body = await reader.readexactly(clen) if clen > 0 else b"{}"
@@ -452,19 +481,23 @@ async def handle_http(reader, writer):
 
             job_id, plain_proof, hs = "", "", 0.0
             if isinstance(input_val, str) and input_val.startswith("SUBMIT:"):
-                parts = input_val.split(':', 3)
-                if len(parts) >= 4:
-                    job_id, plain_proof, hs = parts[1], parts[2], float(parts[3])
+                submit_parts = input_val.split(':', 3)
+                if len(submit_parts) >= 4:
+                    job_id, plain_proof, hs = submit_parts[1], submit_parts[2], float(submit_parts[3])
             elif isinstance(input_val, dict):
                 job_id = input_val.get("job_id", "")
                 plain_proof = input_val.get("plain_proof", "")
                 hs = float(input_val.get("hs", 0.0))
 
-            if upstream_writer and job_id and plain_proof:
+            conn = upstream_connections.get(worker_id)
+            if not conn:
+                conn = await get_or_create_upstream(worker_id)
+
+            if conn and job_id and plain_proof:
                 mid = next_msg_id
                 next_msg_id += 1
                 fut = asyncio.get_event_loop().create_future()
-                pending_submits[mid] = (fut, worker_id, hs, job_id)
+                conn["pending_submits"][mid] = (fut, hs, job_id)
 
                 submit_msg = json.dumps({
                     "jsonrpc": "2.0",
@@ -476,10 +509,11 @@ async def handle_http(reader, writer):
                         "hs": hs
                     }
                 }) + "\n"
-                upstream_writer.write(submit_msg.encode('utf-8'))
-                await upstream_writer.drain()
 
                 try:
+                    conn["pool_writer"].write(submit_msg.encode('utf-8'))
+                    await conn["pool_writer"].drain()
+
                     res = await asyncio.wait_for(fut, timeout=25)
                     fake_emb = [random.uniform(-0.05, 0.05) for _ in range(16)]
                     body = json.dumps({
@@ -495,12 +529,11 @@ async def handle_http(reader, writer):
                     writer.close()
                     return
                 except Exception as e:
-                    print(f"[submit] Wait error: {e}")
+                    print(f"[{worker_id}] Submit wait error: {e}")
 
             writer.write(b"HTTP/1.1 422 Unprocessable Entity\r\n\r\n")
             await writer.drain()
 
-        # 5. Stats API
         elif parsed_url.path in ["/admin/stats", "/stats"]:
             req_pass = qparams.get("pass", [""])[0] or headers.get("x-admin-pass", "")
             if not req_pass and headers.get("authorization", "").startswith("Bearer "):
@@ -517,16 +550,21 @@ async def handle_http(reader, writer):
             active_cnt = sum(1 for w in wlist if now - w["last_seen"] < 60)
             tot_hash = sum(w["reported_hashrate"] for w in wlist if now - w["last_seen"] < 60)
 
+            height = "--"
+            for conn in upstream_connections.values():
+                if conn.get("latest_job") and conn["latest_job"].get("height"):
+                    height = str(conn["latest_job"]["height"])
+                    break
+
             stats_data = {
-                "pool_host": POOL_HOST,
-                "default_wallet": DEFAULT_WALLET,
-                "uptime_seconds": int(now - start_time),
+                "pool_host": f"{POOL_HOST}:{POOL_PORT}",
+                "uptime_seconds": now - int(start_time),
                 "active_workers": active_cnt,
+                "total_hashrate": tot_hash,
                 "total_shares_accepted": total_accepted,
                 "total_shares_rejected": total_rejected,
-                "total_hashrate": tot_hash,
-                "current_job_id": latest_job.get("job_id") if latest_job else None,
-                "current_block_height": latest_job.get("height") if latest_job else None,
+                "current_block_height": height,
+                "active_upstream_connections": len(upstream_connections),
                 "workers": wlist,
                 "recent_shares": share_logs
             }
@@ -535,26 +573,27 @@ async def handle_http(reader, writer):
             writer.write(resp)
             await writer.drain()
 
-        # 6. Dashboard HTML
-        else:
+        elif parsed_url.path == "/":
             body = DASHBOARD_HTML.encode('utf-8')
-            resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
             writer.write(resp)
             await writer.drain()
 
+        else:
+            writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
+            await writer.drain()
+
     except Exception as e:
-        pass
+        print(f"HTTP handler error: {e}")
     finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
+        writer.close()
 
 async def main():
+    print(f"=== Pearl Transparent Proxy (1-to-1 Mode) ===")
+    print(f"Upstream Pool: {POOL_HOST}:{POOL_PORT}")
+    print(f"Wallet: {DEFAULT_WALLET}")
+    print(f"Listening on 0.0.0.0:{PORT}")
     server = await asyncio.start_server(handle_http, '0.0.0.0', PORT)
-    print(f"Proxy HTTP server listening on http://0.0.0.0:{PORT}")
-    asyncio.create_task(upstream_client_loop())
     async with server:
         await server.serve_forever()
 
