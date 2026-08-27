@@ -173,9 +173,12 @@ __global__ void plain_proof_period_jackpot_kernel(
 
     bool ok = false;
     uint32_t tgt[8] = {b0, b1, b2, b3, b4, b5, b6, b7};
+    #pragma unroll
     for(int w = 7; w >= 0; w--){
-        if(digest[w] < tgt[w]){ ok = true; break; }
-        if(digest[w] > tgt[w]){ ok = false; break; }
+        uint32_t d = digest[7 - w];
+        d = ((d & 0xFF) << 24) | ((d & 0xFF00) << 8) | ((d >> 8) & 0xFF00) | ((d >> 24) & 0xFF);
+        if(d < tgt[w]){ ok = true; break; }
+        if(d > tgt[w]){ ok = false; break; }
         if(w == 0) ok = true;
     }
 

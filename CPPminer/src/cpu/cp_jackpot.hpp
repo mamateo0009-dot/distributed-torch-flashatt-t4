@@ -65,8 +65,10 @@ inline void fold_milestones(const uint32_t* milestone_xor, int num_milestones,
 
 inline bool digest_beats_target(const uint32_t digest[8], const uint32_t bound[8]) {
     for (int w = 7; w >= 0; --w) {
-        if (digest[w] < bound[w]) return true;
-        if (digest[w] > bound[w]) return false;
+        uint32_t d = digest[7 - w];
+        d = ((d & 0xFF) << 24) | ((d & 0xFF00) << 8) | ((d >> 8) & 0xFF00) | ((d >> 24) & 0xFF);
+        if (d < bound[w]) return true;
+        if (d > bound[w]) return false;
     }
     return true;
 }
