@@ -1,8 +1,9 @@
 #ifndef CP_CUTLASS_H
 #define CP_CUTLASS_H
 
-#include <stddef.h>
 #include <stdint.h>
+#include <stddef.h>
+#include <cuda_runtime.h>
 
 #ifdef __cplusplus
 extern "C" {
