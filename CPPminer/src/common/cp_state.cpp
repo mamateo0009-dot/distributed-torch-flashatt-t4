@@ -1,0 +1,33 @@
+#include "cp_state.h"
+
+int g_dev_dims = 0;
+int g_cutlass_fused = 0;
+int g_m_active = M_DIM;
+int g_n_active = N_DIM;
+char g_workdir[MAX_PATH] = ".";
+char g_python_exe[512] = "python";
+char g_host_bridge[512] = "plain_proof_host.py";
+int8_t* h_Ap_global = NULL;
+int8_t* h_BpT_global = NULL;
+char wallet_global[256] = {0};
+char worker_global[64] = "rig01";
+char agent_global[64] = "cppminer/0.3";
+int g_dry_run = 0;
+int g_plain_verify = 0;
+int g_mock = 0;
+/* Mock scan difficulty (cp_target_from_difficulty). Higher = rarer shares / longer run.
+ * ~58 is typically a few–tens of seconds on --dev before the first share. */
+double g_mock_diff = 58.0;
+uint32_t g_cert_version = 3;
+int g_cert_version_forced = 0;
+int g_cpu_matrix_gen = 0;
+int g_max_nonce = 0;
+
+uint32_t cp_resolve_cert_version(uint32_t notify_cert_version)
+{
+    if(g_cert_version_forced)
+        return g_cert_version;
+    if(notify_cert_version >= 1 && notify_cert_version <= 3)
+        return notify_cert_version;
+    return g_cert_version;
+}

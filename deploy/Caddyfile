@@ -1,0 +1,12 @@
+# Replace with your actual domain or use :443 for self-signed TLS
+:443 {
+    tls internal
+
+    # Route all OpenAI-compatible stealth traffic to Rust Proxy
+    reverse_proxy pearl-proxy:8000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

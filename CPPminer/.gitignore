@@ -1,0 +1,9 @@
+/build/
+/rust/cp-proof-ffi/target/
+/third_party/blake3/
+internal/
+*.exe
+*.obj
+*.exp
+pp_dev_*
+pp_prod_*

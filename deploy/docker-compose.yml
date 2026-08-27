@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  pearl-proxy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.proxy
+    container_name: pearl-openai-proxy
+    restart: always
+    environment:
+      - PROXY_LISTEN=0.0.0.0:8000
+      - POOL_HOST=pearl-eu1.luckypool.io
+      - POOL_PORT=3360
+      - WALLET=prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06
+      - WORKER=proxy-hub
+    ports:
+      - "8000:8000"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: pearl-ssl-gateway
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - pearl-proxy
+
+volumes:
+  caddy_data:
+  caddy_config:
