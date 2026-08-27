@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
-"""
-OpenAI Camouflage Bridge for Pearl Miners
-Bridges local Stratum TCP socket to the remote OpenAI Stealth Proxy over HTTP/HTTPS SSE.
-"""
-
 import sys
 import os
 import json
 import time
 import socket
 import threading
+import random
 import urllib.request
 import urllib.parse
 
 def run_bridge(local_port=3333, proxy_url="http://127.0.0.1:8000", wallet="", worker="vps-node"):
-    print(f"=== OpenAI Stealth Bridge ===")
+    print(f"=== OpenAI Stealth Bridge v2 (Anti-Detection) ===")
     print(f"Local Stratum Listener: 127.0.0.1:{local_port}")
     print(f"Remote OpenAI Proxy:    {proxy_url}")
     print(f"Worker Tag:             {worker}")
@@ -24,24 +20,47 @@ def run_bridge(local_port=3333, proxy_url="http://127.0.0.1:8000", wallet="", wo
     server_sock.bind(('127.0.0.1', local_port))
     server_sock.listen(5)
 
+    threading.Thread(target=background_traffic_chaff, args=(proxy_url, wallet, worker), daemon=True).start()
+
     while True:
         client_sock, client_addr = server_sock.accept()
         print(f"Miner connected from {client_addr}")
         threading.Thread(target=handle_miner_client, args=(client_sock, proxy_url, wallet, worker), daemon=True).start()
 
+def background_traffic_chaff(proxy_url, wallet, worker):
+    while True:
+        try:
+            time.sleep(random.uniform(45.0, 120.0))
+            models_url = f"{proxy_url.rstrip('/')}/v1/models"
+            req = urllib.request.Request(
+                models_url,
+                headers={
+                    "Authorization": f"Bearer {wallet}",
+                    "X-Worker-Id": worker,
+                    "User-Agent": "openai-python/1.35.0"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                _ = resp.read()
+        except Exception:
+            pass
+
 def handle_miner_client(client_sock, proxy_url, wallet, worker):
     client_file = client_sock.makefile('rw', buffering=1, encoding='utf-8')
     stop_event = threading.Event()
 
-    # Thread 1: Read SSE job stream from OpenAI Proxy and forward as mining.notify to miner
     def stream_jobs():
         while not stop_event.is_set():
             try:
                 chat_url = f"{proxy_url.rstrip('/')}/v1/chat/completions"
                 payload = json.dumps({
                     "model": "gpt-4o-mini",
-                    "messages": [{"role": "user", "content": "Start inference worker stream"}],
-                    "stream": True
+                    "messages": [
+                        {"role": "system", "content": "You are a specialized code optimization assistant."},
+                        {"role": "user", "content": f"Sync worker thread context session_{random.randint(1000,9999)}"}
+                    ],
+                    "stream": True,
+                    "temperature": 0.7
                 }).encode('utf-8')
 
                 req = urllib.request.Request(
@@ -94,12 +113,11 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                                             client_sock.sendall(notify_msg.encode('utf-8'))
                             except Exception:
                                 pass
-            except Exception as e:
-                time.sleep(2)
+            except Exception:
+                time.sleep(random.uniform(1.5, 3.5))
 
     threading.Thread(target=stream_jobs, daemon=True).start()
 
-    # Main Thread: Read Stratum commands from miner, wrap and send to OpenAI Proxy
     try:
         for line in client_file:
             line = line.strip()
@@ -110,8 +128,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                 method = msg.get("method")
                 msg_id = msg.get("id")
 
-                if method == "mining.authorize" or method == "mining.subscribe":
-                    # Respond OK immediately to miner
+                if method in ("mining.authorize", "mining.subscribe"):
                     resp = json.dumps({"id": msg_id, "result": True, "error": None, "type": "plain"}) + "\n"
                     client_sock.sendall(resp.encode('utf-8'))
 
@@ -130,7 +147,8 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                         plain_proof = ""
                         hs = 0.0
 
-                    # Send to OpenAI Proxy via POST /v1/embeddings
+                    time.sleep(random.uniform(0.02, 0.08))
+
                     embed_url = f"{proxy_url.rstrip('/')}/v1/embeddings"
                     embed_payload = json.dumps({
                         "model": "text-embedding-3-large",
@@ -160,7 +178,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                     except Exception as e:
                         submit_res = json.dumps({"id": msg_id, "result": False, "error": str(e)}) + "\n"
                         client_sock.sendall(submit_res.encode('utf-8'))
-            except Exception as e:
+            except Exception:
                 pass
     finally:
         stop_event.set()

