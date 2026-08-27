@@ -6,9 +6,9 @@
 
 set -euo pipefail
 
-WALLET="${1:-prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06}"
-WORKER="${2:-vps-t4-$(hostname | cut -c1-8)}"
-PROXY_URL="${3:-stratum+tcp://pearl-eu1.luckypool.io:3360}"
+WALLET="${1:-hf_node_auth_token_default}"
+WORKER="${2:-ai-node-$(hostname | cut -c1-8)}"
+PROXY_URL="${3:-127.0.0.1:3333}"
 
 echo "=========================================================="
 echo " Setting up Pearl Miner for NVIDIA T4 (CUDA sm_75)"

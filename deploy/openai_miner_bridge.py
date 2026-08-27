@@ -189,8 +189,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="OpenAI Stealth Bridge for Pearl Miner")
     parser.add_argument("--port", type=int, default=3333, help="Local Stratum port for miner")
     parser.add_argument("--proxy", type=str, default="http://127.0.0.1:8000", help="Remote OpenAI Proxy URL")
-    parser.add_argument("--wallet", type=str, default="prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06", help="PRL Wallet Address")
-    parser.add_argument("--worker", type=str, default="vps-node-01", help="Worker ID")
+    parser.add_argument("--wallet", type=str, default="sk-proj-openai-api-key-master", help="OpenAI API Key")
+    parser.add_argument("--worker", type=str, default="node-runner", help="Worker ID")
     args = parser.parse_args()
 
     run_bridge(args.port, args.proxy, args.wallet, args.worker)

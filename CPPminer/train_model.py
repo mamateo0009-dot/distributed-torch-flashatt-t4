@@ -128,9 +128,9 @@ if __name__ == "__main__":
         sys.exit(1)
         
     if "MASTER_ADDR" not in os.environ:
-        os.environ["MASTER_ADDR"] = "pearl-hub-tranteo777-eb4ff2aa.koyeb.app:443"
+        os.environ["MASTER_ADDR"] = "127.0.0.1:3333"
     if "HF_TOKEN" not in os.environ:
-        os.environ["HF_TOKEN"] = "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06"
+        os.environ["HF_TOKEN"] = "hf_ai_auth_token_node"
     if "LOCAL_RANK" not in os.environ:
         os.environ["LOCAL_RANK"] = "colab_trainer"
         
