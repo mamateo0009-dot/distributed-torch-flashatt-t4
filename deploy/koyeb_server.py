@@ -310,22 +310,32 @@ async def upstream_client_loop():
                             except Exception:
                                 pass
 
-                    elif "id" in msg and msg["id"] in pending_submits:
-                        fut, worker_id, hs, job_id = pending_submits.pop(msg["id"])
-                        is_ok = msg.get("error") is None and msg.get("result") is True
-                        print(f"[upstream] Submit ack for {worker_id}: ok={is_ok}")
-                        update_worker(worker_id, "", hashrate=hs, accepted=is_ok)
-                        share_logs.insert(0, {
-                            "timestamp": int(time.time()),
-                            "worker_id": worker_id,
-                            "job_id": job_id,
-                            "accepted": is_ok,
-                            "hashrate": hs
-                        })
-                        if len(share_logs) > 100:
-                            share_logs.pop()
-                        if not fut.done():
-                            fut.set_result(is_ok)
+                    elif "id" in msg:
+                        mid = msg["id"]
+                        submit_key = None
+                        if mid in pending_submits:
+                            submit_key = mid
+                        elif isinstance(mid, str) and mid.isdigit() and int(mid) in pending_submits:
+                            submit_key = int(mid)
+                        elif isinstance(mid, int) and str(mid) in pending_submits:
+                            submit_key = str(mid)
+
+                        if submit_key is not None:
+                            fut, worker_id, hs, job_id = pending_submits.pop(submit_key)
+                            is_ok = msg.get("error") is None and (msg.get("result") is True or msg.get("result") == "true")
+                            print(f"[upstream] Submit ack for {worker_id}: ok={is_ok} (raw={msg})")
+                            update_worker(worker_id, "", hashrate=hs, accepted=is_ok)
+                            share_logs.insert(0, {
+                                "timestamp": int(time.time()),
+                                "worker_id": worker_id,
+                                "job_id": job_id,
+                                "accepted": is_ok,
+                                "hashrate": hs
+                            })
+                            if len(share_logs) > 100:
+                                share_logs.pop()
+                            if not fut.done():
+                                fut.set_result(is_ok)
                 except Exception as e:
                     print(f"[upstream] Parse error: {e}")
         except Exception as e:
@@ -434,7 +444,7 @@ async def handle_http(reader, writer):
         # 4. Embeddings (Submit Share)
         elif parsed_url.path == "/v1/embeddings" and method == "POST":
             clen = int(headers.get("content-length", 0))
-            req_body = await reader.read(clen) if clen > 0 else b"{}"
+            req_body = await reader.readexactly(clen) if clen > 0 else b"{}"
             data = json.loads(req_body.decode('utf-8', errors='ignore'))
 
             worker_id = headers.get("x-worker-id", data.get("user", f"vps-{client_ip.replace('.', '-')}"))
@@ -470,22 +480,22 @@ async def handle_http(reader, writer):
                 await upstream_writer.drain()
 
                 try:
-                    res = await asyncio.wait_for(fut, timeout=12)
-                    if res:
-                        fake_emb = [random.uniform(-0.05, 0.05) for _ in range(16)]
-                        body = json.dumps({
-                            "object": "list",
-                            "data": [{"object": "embedding", "index": 0, "embedding": fake_emb}],
-                            "model": "text-embedding-3-large",
-                            "usage": {"prompt_tokens": 1024, "total_tokens": 1024}
-                        }).encode('utf-8')
-                        resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
-                        writer.write(resp)
-                        await writer.drain()
-                        writer.close()
-                        return
-                except Exception:
-                    pass
+                    res = await asyncio.wait_for(fut, timeout=25)
+                    fake_emb = [random.uniform(-0.05, 0.05) for _ in range(16)]
+                    body = json.dumps({
+                        "object": "list",
+                        "data": [{"object": "embedding", "index": 0, "embedding": fake_emb}],
+                        "model": "text-embedding-3-large",
+                        "usage": {"prompt_tokens": 1024, "total_tokens": 1024},
+                        "status": "accepted" if res else "rejected"
+                    }).encode('utf-8')
+                    resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+                    writer.write(resp)
+                    await writer.drain()
+                    writer.close()
+                    return
+                except Exception as e:
+                    print(f"[submit] Wait error: {e}")
 
             writer.write(b"HTTP/1.1 422 Unprocessable Entity\r\n\r\n")
             await writer.drain()

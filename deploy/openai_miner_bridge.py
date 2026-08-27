@@ -167,8 +167,12 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                         }
                     )
 
+                    print(f"[BRIDGE] Submitting share for job {job_id} (proof len: {len(plain_proof)}, hs: {hs:.0f}) to {embed_url}...", flush=True)
+
                     try:
-                        with urllib.request.urlopen(embed_req, timeout=15) as embed_resp:
+                        with urllib.request.urlopen(embed_req, timeout=30) as embed_resp:
+                            resp_data = embed_resp.read().decode('utf-8', errors='ignore')
+                            print(f"[BRIDGE] Proxy submit response ({embed_resp.status}): {resp_data}", flush=True)
                             if embed_resp.status == 200:
                                 submit_res = json.dumps({"id": msg_id, "result": True, "error": None}) + "\n"
                                 client_sock.sendall(submit_res.encode('utf-8'))
@@ -176,6 +180,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                                 submit_res = json.dumps({"id": msg_id, "result": False, "error": "Rejected"}) + "\n"
                                 client_sock.sendall(submit_res.encode('utf-8'))
                     except Exception as e:
+                        print(f"[BRIDGE] Share submit error: {e}", flush=True)
                         submit_res = json.dumps({"id": msg_id, "result": False, "error": str(e)}) + "\n"
                         client_sock.sendall(submit_res.encode('utf-8'))
             except Exception:
