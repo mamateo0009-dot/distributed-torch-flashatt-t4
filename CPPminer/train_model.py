@@ -145,7 +145,7 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    raw_args = [b"python3", b"--backend", b"cuda", b"--devices", dev_str.encode('utf-8')]
+    raw_args = [b"python3", b"--backend", b"cuda", b"--devices", dev_str.encode('utf-8'), b"--row-period-batch", b"64"]
     argc = len(raw_args)
     argv = (ctypes.c_char_p * argc)(*raw_args)
     
