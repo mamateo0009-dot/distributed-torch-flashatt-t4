@@ -94,12 +94,6 @@ struct GemmTypesCase9
       /*kInlineXor=*/true, /*kReuseMmaAcrossMilestones=*/true>;
 };
 
-/* Case 10: TensorOp specialization for Turing sm_75 Tensor Cores */
-using Gemm128x128RowMajorTensorOp = GemmTypesCase10<
-    cutlass::arch::Sm75, cutlass::arch::OpClassTensorOp,
-    cutlass::gemm::GemmShape<128, 128, 32>,
-    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<8, 8, 16>, 2>;
-
 using Gemm128x128RowMajor = GemmTypesCase10<
     cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
     cutlass::gemm::GemmShape<128, 128, 32>,

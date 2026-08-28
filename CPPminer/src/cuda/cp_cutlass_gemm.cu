@@ -21,17 +21,15 @@ static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128StepMajor>
     g_fused_step_major;
 static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajor>
     g_fused_row_major;
-static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajorTensorOp>
-    g_fused_row_major_tensorop;
 
-static int g_tensorop_configured = 0;
+static int g_configured_attributes = 0;
 
 static void cp_cutlass_configure_attributes()
 {
-  if (g_tensorop_configured) return;
-  const void* kernel_ptr = (const void*)cutlass::Kernel<typename cp_cutlass::Gemm128x128RowMajorTensorOp::GemmKernel>;
+  if (g_configured_attributes) return;
+  const void* kernel_ptr = (const void*)cutlass::Kernel<typename cp_cutlass::Gemm128x128RowMajor::GemmKernel>;
   cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-  g_tensorop_configured = 1;
+  g_configured_attributes = 1;
 }
 
 int cp_cutlass_device_ok(int dev)
@@ -85,17 +83,9 @@ int cp_cutlass_period_batch(
   }
 
   cutlass::Status st = cutlass::Status::kErrorInternal;
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, dev);
-  bool use_tensorop = (!step_major) && ((prop.major == 7 && prop.minor >= 5) || prop.major > 7);
+  cp_cutlass_configure_attributes();
 
-  if (use_tensorop) {
-    cp_cutlass_configure_attributes();
-    CP_CUTLASS_CHECK(g_fused_row_major_tensorop.initialize(
-        M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
-        d_tile_xor, cta_cols, tile_count, jackpot));
-    st = g_fused_row_major_tensorop(stream);
-  } else if (step_major) {
+  if (step_major) {
     CP_CUTLASS_CHECK(g_fused_step_major.initialize(
         M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
         d_tile_xor, cta_cols, tile_count, jackpot));
