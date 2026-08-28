@@ -9,6 +9,7 @@
 #define CP_CUTLASS_JACKPOT_LROT 13
 
 using CutlassJackpotTile = MmaLaneTile128x128;
+using CutlassTensorOpJackpotTile = MmaTensorOpLaneTile128x128;
 
 __device__ __forceinline__ uint32_t cp_cutlass_rotl32(uint32_t x, int s)
 {
@@ -33,6 +34,7 @@ __device__ __forceinline__ bool cp_cutlass_jackpot_target_ok(
     return true;
 }
 
+template <typename TileType = CutlassJackpotTile>
 __device__ __forceinline__ void cp_cutlass_tile_origin(
     int row_period, int col_period, int thread_idx,
     int* out_t_rows, int* out_t_cols)
@@ -41,12 +43,13 @@ __device__ __forceinline__ void cp_cutlass_tile_origin(
     const int cta_col0 = col_period * CP_CUTLASS_CTA_N;
     int row = 0;
     int col = 0;
-    CutlassJackpotTile::thread_cell_global(
+    TileType::thread_cell_global(
         cta_row0, cta_col0, thread_idx, row, col);
     *out_t_rows = row;
     *out_t_cols = col;
 }
 
+template <typename TileType = CutlassJackpotTile>
 __device__ __forceinline__ void cp_cutlass_jackpot_try(
     const uint32_t jackpot_words[CP_CUTLASS_JACKPOT_WORDS],
     const uint32_t* a_key8,
@@ -73,8 +76,8 @@ __device__ __forceinline__ void cp_cutlass_jackpot_try(
 
     int t_rows = 0;
     int t_cols = 0;
-    cp_cutlass_tile_origin(row_period, col_period, thread_idx,
-                           &t_rows, &t_cols);
+    cp_cutlass_tile_origin<TileType>(row_period, col_period, thread_idx,
+                                     &t_rows, &t_cols);
     *out_t_rows = t_rows;
     *out_t_cols = t_cols;
 }

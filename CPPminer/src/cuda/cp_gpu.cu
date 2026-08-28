@@ -289,6 +289,19 @@ void cp_gpu_set_cutlass_fused(int on)
         g_gpus[i].use_cutlass_fused = g_cutlass_fused;
 }
 
+int cp_gpu_default_tile_layout(void)
+{
+    if (g_cutlass_fused) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (cp_cutlass_is_tensorop_supported(dev)) {
+            return CP_TILE_LAYOUT_CUTLASS_TENSOROP;
+        }
+        return CP_TILE_LAYOUT_CUTLASS;
+    }
+    return CP_TILE_LAYOUT_SCATTERED;
+}
+
 void cp_gpu_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_version)
 {
     (void)job_key;

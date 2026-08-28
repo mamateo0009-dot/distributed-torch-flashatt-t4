@@ -12,6 +12,9 @@ extern "C" {
 /* Returns 0 if CUTLASS fused GEMM can run on the current device. */
 int cp_cutlass_device_ok(int dev);
 
+/* Returns 1 if device is Turing SM 7.5 (TensorOp support), 0 otherwise. */
+int cp_cutlass_is_tensorop_supported(int dev);
+
 /* Fused GEMM + in-register milestone XOR for one period batch panel.
  * Panel covers row_batch x col_batch CTAs of 128x128 (Case 10 / MMA lane).
  * When jackpot is non-NULL, BLAKE3/target check runs in the GEMM kernel tail

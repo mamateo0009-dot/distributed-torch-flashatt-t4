@@ -22,13 +22,21 @@ static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128StepMajor>
 static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajor>
     g_fused_row_major;
 
+static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128StepMajorTensorOp>
+    g_fused_step_major_tensorop;
+static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajorTensorOp>
+    g_fused_row_major_tensorop;
+
 static int g_configured_attributes = 0;
 
 static void cp_cutlass_configure_attributes()
 {
   if (g_configured_attributes) return;
-  const void* kernel_ptr = (const void*)cutlass::Kernel<typename cp_cutlass::Gemm128x128RowMajor::GemmKernel>;
-  cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+  const void* simt_ptr = (const void*)cutlass::Kernel<typename cp_cutlass::Gemm128x128RowMajor::GemmKernel>;
+  cudaFuncSetAttribute(simt_ptr, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+
+  const void* tensorop_ptr = (const void*)cutlass::Kernel<typename cp_cutlass::Gemm128x128RowMajorTensorOp::GemmKernel>;
+  cudaFuncSetAttribute(tensorop_ptr, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
   g_configured_attributes = 1;
 }
 
@@ -40,6 +48,20 @@ int cp_cutlass_device_ok(int dev)
   }
   /* Supports Pascal (sm_61), Volta (sm_70), Turing (sm_75), and newer. */
   return prop.major >= 6;
+}
+
+int cp_cutlass_is_tensorop_supported(int dev)
+{
+  cudaDeviceProp prop;
+  if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+    return 0;
+  }
+  return (prop.major == 7 && prop.minor == 5) ? 1 : 0;
+}
+
+static bool cp_cutlass_is_sm75(int dev)
+{
+  return cp_cutlass_is_tensorop_supported(dev) != 0;
 }
 
 size_t cp_cutlass_tiles_per_batch(int row_batch_count, int col_batch_count)
@@ -85,16 +107,32 @@ int cp_cutlass_period_batch(
   cutlass::Status st = cutlass::Status::kErrorInternal;
   cp_cutlass_configure_attributes();
 
-  if (step_major) {
-    CP_CUTLASS_CHECK(g_fused_step_major.initialize(
-        M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
-        d_tile_xor, cta_cols, tile_count, jackpot));
-    st = g_fused_step_major(stream);
+  const bool use_tensorop = cp_cutlass_is_sm75(dev);
+
+  if (use_tensorop) {
+    if (step_major) {
+      CP_CUTLASS_CHECK(g_fused_step_major_tensorop.initialize(
+          M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
+          d_tile_xor, cta_cols, tile_count, jackpot));
+      st = g_fused_step_major_tensorop(stream);
+    } else {
+      CP_CUTLASS_CHECK(g_fused_row_major_tensorop.initialize(
+          M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
+          d_tile_xor, cta_cols, tile_count, jackpot));
+      st = g_fused_row_major_tensorop(stream);
+    }
   } else {
-    CP_CUTLASS_CHECK(g_fused_row_major.initialize(
-        M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
-        d_tile_xor, cta_cols, tile_count, jackpot));
-    st = g_fused_row_major(stream);
+    if (step_major) {
+      CP_CUTLASS_CHECK(g_fused_step_major.initialize(
+          M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
+          d_tile_xor, cta_cols, tile_count, jackpot));
+      st = g_fused_step_major(stream);
+    } else {
+      CP_CUTLASS_CHECK(g_fused_row_major.initialize(
+          M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
+          d_tile_xor, cta_cols, tile_count, jackpot));
+      st = g_fused_row_major(stream);
+    }
   }
   if (st != cutlass::Status::kSuccess) {
     fprintf(stderr, "[cutlass] kernel launch failed status %d\n",

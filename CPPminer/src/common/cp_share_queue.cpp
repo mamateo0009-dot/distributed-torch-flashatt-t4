@@ -217,12 +217,11 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
 
     int tile_layout = cp_worker_default_tile_layout();
-    if (g_cutlass_fused) {
-        tile_layout = CP_TILE_LAYOUT_CUTLASS;
-    }
 
     const uint8_t *mining_cfg = PEARL_SCATTERED_CONFIG;
-    if (tile_layout == CP_TILE_LAYOUT_CUTLASS) {
+    if (tile_layout == CP_TILE_LAYOUT_CUTLASS_TENSOROP) {
+        mining_cfg = PEARL_CUTLASS_TENSOROP_CONFIG;
+    } else if (tile_layout == CP_TILE_LAYOUT_CUTLASS) {
         mining_cfg = PEARL_CUTLASS_CONFIG;
     } else if (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) {
         mining_cfg = PEARL_CONTIGUOUS_8x8_CONFIG;

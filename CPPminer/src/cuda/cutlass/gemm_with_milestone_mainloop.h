@@ -328,7 +328,11 @@ public:
           params.jackpot.row_period0 + threadblock_tile_offset.m();
       const int col_period_eff =
           params.jackpot.col_period0 + threadblock_tile_offset.n();
-      cp_cutlass_jackpot_try(
+      using TileType = typename platform::conditional<
+          platform::is_same<typename Mma::Operator::ArchOpClass,
+                            cutlass::arch::OpClassTensorOp>::value,
+          CutlassTensorOpJackpotTile, CutlassJackpotTile>::type;
+      cp_cutlass_jackpot_try<TileType>(
           jackpot_words, params.jackpot.ptr_a_key8, params.jackpot.bound,
           row_period_eff, col_period_eff, thread_idx, params.jackpot.ptr_found,
           params.jackpot.ptr_out_t_rows, params.jackpot.ptr_out_t_cols);

@@ -18,8 +18,11 @@ extern const uint8_t PEARL_CONTIGUOUS_8x8_CONFIG[52];
 extern const uint8_t PEARL_CONTIGUOUS_4x8_CONFIG[52];
 /* Case 7.1 epilogue scatter: 16 A rows x 8 B cols per hash tile. */
 extern const uint8_t PEARL_CUTLASS_CONFIG[52];
+/* Turing Sm75 TensorOp MMA: 4 A rows x 16 B cols per hash tile. */
+extern const uint8_t PEARL_CUTLASS_TENSOROP_CONFIG[52];
 
 void pearl_set_cutlass_fused(int on);
+void pearl_set_cutlass_tensorop(int on);
 
 extern const uint8_t PEARL_SEED_LABEL_A[32];
 extern const uint8_t PEARL_SEED_LABEL_B[32];

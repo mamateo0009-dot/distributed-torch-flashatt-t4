@@ -377,6 +377,10 @@ extern "C" int cp_worker_default_tile_layout(void)
 {
     if(cp_worker_backend_id() == CP_BACKEND_CPU)
         return CP_TILE_LAYOUT_CONTIGUOUS;
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA)
+        return cp_cuda_worker_default_tile_layout();
+#endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     if(cp_worker_backend_id() == CP_BACKEND_OPENCL) {
         if(cp_opencl_hash_tile_mr() == 4 && cp_opencl_hash_tile_w() == 8)

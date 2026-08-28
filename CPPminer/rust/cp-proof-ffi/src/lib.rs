@@ -21,6 +21,13 @@ const SCATTERED_COLS: [usize; 16] = [
 const CUTLASS_ROWS: [usize; 8] = [0, 1, 2, 3, 16, 17, 18, 19];
 const CUTLASS_COLS: [usize; 8] = [0, 1, 2, 3, 32, 33, 34, 35];
 
+/// CUTLASS Turing Sm75 TensorOp MMA tile (128x128 CTA, 4x16 cells/thread).
+/// Must match `MmaTensorOpLaneTile128x128`.
+const CUTLASS_TENSOROP_ROWS: [usize; 4] = [0, 8, 16, 24];
+const CUTLASS_TENSOROP_COLS: [usize; 16] = [
+    0, 1, 8, 9, 16, 17, 24, 25, 32, 33, 40, 41, 48, 49, 56, 57,
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TileLayout {
     Scattered = 0,
@@ -28,6 +35,7 @@ enum TileLayout {
     Cutlass = 2,
     Contiguous8x8 = 3,
     Contiguous4x8 = 4,
+    CutlassTensorOp = 5,
 }
 
 impl TileLayout {
@@ -38,7 +46,8 @@ impl TileLayout {
             2 => Ok(Self::Cutlass),
             3 => Ok(Self::Contiguous8x8),
             4 => Ok(Self::Contiguous4x8),
-            _ => Err(format!("invalid tile_layout {v} (expected 0, 1, 2, 3, or 4)")),
+            5 => Ok(Self::CutlassTensorOp),
+            _ => Err(format!("invalid tile_layout {v} (expected 0..5)")),
         }
     }
 }
@@ -90,6 +99,7 @@ fn row_patterns(layout: TileLayout) -> (&'static [usize], &'static [usize]) {
             &[0, 1, 2, 3, 4, 5, 6, 7],
         ),
         TileLayout::Cutlass => (&CUTLASS_ROWS, &CUTLASS_COLS),
+        TileLayout::CutlassTensorOp => (&CUTLASS_TENSOROP_ROWS, &CUTLASS_TENSOROP_COLS),
     }
 }
 
@@ -460,6 +470,39 @@ mod tests {
         assert_eq!(pp.bt.row_indices.len(), 8);
         assert_eq!(pp.a.row_indices[0], 8);
         assert_eq!(pp.bt.row_indices[0], 16);
+    }
+
+    #[test]
+    fn cutlass_tensorop_proof_row_counts() {
+        let m = 128;
+        let n = 128;
+        let k = 256;
+        let a: Vec<i8> = vec![0; m * k];
+        let bt: Vec<i8> = vec![0; n * k];
+        let header = [0u8; 76];
+        let row_offsets: Vec<u32> = CUTLASS_TENSOROP_ROWS.iter().map(|&o| o as u32).collect();
+        let col_offsets: Vec<u32> = CUTLASS_TENSOROP_COLS.iter().map(|&o| o as u32).collect();
+        let config = mining_config_bytes(256, 256, &row_offsets, &col_offsets).unwrap();
+        let b64 = build_plain_proof_b64(
+            &header,
+            &config,
+            &a,
+            &bt,
+            m,
+            n,
+            k,
+            256,
+            0,
+            0,
+            TileLayout::CutlassTensorOp,
+        )
+        .expect("cutlass tensorop build");
+        let raw = STANDARD.decode(&b64).unwrap();
+        let pp: PlainProof = bincode::deserialize(&raw).unwrap();
+        assert_eq!(pp.a.row_indices.len(), 4);
+        assert_eq!(pp.bt.row_indices.len(), 16);
+        assert_eq!(pp.a.row_indices[0], 0);
+        assert_eq!(pp.bt.row_indices[0], 0);
     }
 
     #[test]

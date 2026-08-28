@@ -68,7 +68,7 @@ const uint8_t PEARL_CONTIGUOUS_4x8_CONFIG[52] = {
     0x00, 0x00, 0x00, 0x00
 };
 
-/* CUTLASS Case 9: interleaved 4x4 blocks — rows [0,1,2,3,16..19], cols [0,1,2,3,32..35]. */
+/* CUTLASS Case 9: interleaved 4x4 blocks (SIMT) — rows [0,1,2,3,16..19], cols [0,1,2,3,32..35]. */
 const uint8_t PEARL_CUTLASS_CONFIG[52] = {
     0x00, 0x10, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
     0x00, 0x03, 0x03, 0x01, 0x00, 0x00, 0x00, 0x03,
@@ -79,10 +79,22 @@ const uint8_t PEARL_CUTLASS_CONFIG[52] = {
     0x00, 0x00, 0x00, 0x00
 };
 
+/* CUTLASS TensorOp (Sm75): rows [0,8,16,24], cols [0,1,8,9,16,17,24,25,32,33,40,41,48,49,56,57] (4x16). */
+const uint8_t PEARL_CUTLASS_TENSOROP_CONFIG[52] = {
+    0x00, 0x10, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+    0x07, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x03, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00
+};
+
 static int g_pearl_contiguous_tiles = 0;
 static int g_pearl_contiguous_tile_mr = 8;
 static int g_pearl_contiguous_tile_w = 16;
 static int g_pearl_cutlass_fused = 0;
+static int g_pearl_cutlass_tensorop = 0;
 
 void pearl_set_contiguous_tiles(int on){
     g_pearl_contiguous_tiles = on ? 1 : 0;
@@ -101,7 +113,13 @@ void pearl_set_cutlass_fused(int on){
     g_pearl_cutlass_fused = on ? 1 : 0;
 }
 
+void pearl_set_cutlass_tensorop(int on){
+    g_pearl_cutlass_tensorop = on ? 1 : 0;
+}
+
 static const uint8_t* pearl_active_mining_config(void){
+    if(g_pearl_cutlass_tensorop)
+        return PEARL_CUTLASS_TENSOROP_CONFIG;
     if(g_pearl_cutlass_fused)
         return PEARL_CUTLASS_CONFIG;
     if(g_pearl_contiguous_tiles) {

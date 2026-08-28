@@ -46,6 +46,11 @@ extern "C" void cp_cuda_worker_set_cutlass_fused(int on)
     cp_gpu_set_cutlass_fused(on);
 }
 
+extern "C" int cp_cuda_worker_default_tile_layout(void)
+{
+    return cp_gpu_default_tile_layout();
+}
+
 extern "C" void cp_cuda_worker_begin_job(const uint8_t job_key[32], int m, int n,
                                          uint32_t cert_version)
 {
