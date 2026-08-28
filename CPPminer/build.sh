@@ -304,13 +304,19 @@ if [[ -n "$CMAKE_EXE" ]]; then
     cmake --build "${CMAKE_BUILD_DIR}" --config Release \
         || fail "CMake build failed"
 
-    # Locate the built shared library
-    exe=$(find "${CMAKE_BUILD_DIR}" -maxdepth 2 -name libtorch_cuda_backend.so -o -name torch_cuda_backend.so -o -name torch_cuda_backend.dll 2>/dev/null | head -n1)
-    if [[ -z "$exe" ]]; then
-        fail "torch_cuda_backend.so not found after build"
+    # Locate the built shared library and binary executable
+    so_file=$(find "${CMAKE_BUILD_DIR}" -maxdepth 2 -name libtorch_cuda_backend.so -o -name torch_cuda_backend.so -o -name torch_cuda_backend.dll 2>/dev/null | head -n1)
+    if [[ -n "$so_file" ]]; then
+        cp -f "$so_file" "${PROJECT_ROOT}/torch_cuda_backend.so"
+        log "Shared library: ${PROJECT_ROOT}/torch_cuda_backend.so"
     fi
-    cp -f "$exe" "${PROJECT_ROOT}/torch_cuda_backend.so"
-    log "Done: ${PROJECT_ROOT}/torch_cuda_backend.so"
+
+    bin_file=$(find "${CMAKE_BUILD_DIR}" -maxdepth 2 -name cppminer -o -name cppminer.exe 2>/dev/null | head -n1)
+    if [[ -n "$bin_file" ]]; then
+        cp -f "$bin_file" "${PROJECT_ROOT}/cppminer"
+        chmod +x "${PROJECT_ROOT}/cppminer" 2>/dev/null || true
+        log "Executable binary: ${PROJECT_ROOT}/cppminer"
+    fi
 else
     log "Skipping CMake build (cmake not available)"
 fi
