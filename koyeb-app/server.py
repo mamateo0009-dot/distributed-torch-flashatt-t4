@@ -338,6 +338,11 @@ async def upstream_worker_loop(worker_id, pool_reader, pool_writer):
         conn = upstream_connections.get(worker_id)
         if conn and conn.get("pool_writer") is pool_writer:
             upstream_connections.pop(worker_id, None)
+            for q in list(conn.get("sse_queues", [])):
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
         try:
             pool_writer.close()
         except Exception:
@@ -453,6 +458,8 @@ async def handle_http(reader, writer):
                 while True:
                     try:
                         chunk = await asyncio.wait_for(q.get(), timeout=15)
+                        if chunk is None:
+                            break
                         writer.write(f"data: {chunk}\n\n".encode('utf-8'))
                         await writer.drain()
                     except asyncio.TimeoutError:
@@ -470,6 +477,7 @@ async def handle_http(reader, writer):
                 pass
             finally:
                 conn["sse_queues"].discard(q)
+                writer.close()
 
         elif parsed_url.path == "/v1/embeddings" and method == "POST":
             clen = int(headers.get("content-length", 0))
@@ -516,20 +524,26 @@ async def handle_http(reader, writer):
 
                     res = await asyncio.wait_for(fut, timeout=25)
                     fake_emb = [random.uniform(-0.05, 0.05) for _ in range(16)]
-                    body = json.dumps({
-                        "object": "list",
-                        "data": [{"object": "embedding", "index": 0, "embedding": fake_emb}],
-                        "model": "text-embedding-3-large",
-                        "usage": {"prompt_tokens": 1024, "total_tokens": 1024},
-                        "status": "accepted" if res else "rejected"
-                    }).encode('utf-8')
-                    resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+                    if res:
+                        body = json.dumps({
+                            "object": "list",
+                            "data": [{"object": "embedding", "index": 0, "embedding": fake_emb}],
+                            "model": "text-embedding-3-large",
+                            "usage": {"prompt_tokens": 1024, "total_tokens": 1024},
+                            "status": "accepted"
+                        }).encode('utf-8')
+                        resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+                    else:
+                        err_body = json.dumps({"error": {"message": "Share rejected by pool", "type": "invalid_request_error"}}).encode('utf-8')
+                        resp = b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: " + str(len(err_body)).encode() + b"\r\n\r\n" + err_body
                     writer.write(resp)
                     await writer.drain()
                     writer.close()
                     return
                 except Exception as e:
                     print(f"[{worker_id}] Submit wait error: {e}")
+                finally:
+                    conn["pending_submits"].pop(mid, None)
 
             writer.write(b"HTTP/1.1 422 Unprocessable Entity\r\n\r\n")
             await writer.drain()

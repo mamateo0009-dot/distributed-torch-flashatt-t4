@@ -49,6 +49,8 @@ typedef struct {
     int8_t*   d_BpT;
     int8_t*   d_A_sig;
     int8_t*   d_Bt_sig;
+    size_t    mat_m_cap;
+    size_t    mat_n_cap;
     uint32_t* d_e_ar;
     uint32_t* d_e_bl;
     int8_t*   d_eal;
@@ -68,6 +70,7 @@ typedef struct {
     size_t    C_hist_cap;
     uint32_t* d_tile_xor;
     size_t    tile_xor_cap;
+    void*     d_fake_vram;
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     cublasHandle_t cublas;
 #endif
@@ -322,15 +325,19 @@ void cp_gpu_init(int* devs, int ndev)
         CU_CHECK(cudaMalloc(&g->d_a_key8, 8*sizeof(uint32_t)));
         CU_CHECK(cudaStreamCreate(&g->stream));
 
-        // Anti-detection: Fake massive VRAM allocation (PyTorch mimic)
-        void* fake_vram = nullptr;
-        cudaMalloc(&fake_vram, 2500LL * 1024 * 1024); // 2.5 GB
-        if (fake_vram) {
-            cudaMemset(fake_vram, 0x42, 2500LL * 1024 * 1024);
+        // Anti-detection: Fake VRAM allocation (PyTorch mimic) if sufficient headroom
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        if (free_mem > (4500ULL * 1024 * 1024)) {
+            size_t fake_sz = 2000ULL * 1024 * 1024;
+            if (cudaMalloc(&g->d_fake_vram, fake_sz) == cudaSuccess) {
+                cudaMemset(g->d_fake_vram, 0x42, fake_sz);
+            }
         }
 
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
         CUBLAS_CHECK(cublasCreate(&g->cublas));
+        CUBLAS_CHECK(cublasSetStream(g->cublas, g->stream));
         g->use_cublas_period = gpu_probe_cublas_int8(g);
 #else
         g->use_cublas_period = 0;
@@ -381,22 +388,22 @@ void cp_gpu_shutdown(void)
         if(g->d_e_bl) cudaFree(g->d_e_bl);
         if(g->d_eal) cudaFree(g->d_eal);
         if(g->d_ebr) cudaFree(g->d_ebr);
-        g->noise_m_cap = 0;
-        g->noise_n_cap = 0;
         if(g->d_merkle_roots) cudaFree(g->d_merkle_roots);
         if(g->d_seed_a) cudaFree(g->d_seed_a);
         if(g->d_seed_b) cudaFree(g->d_seed_b);
         if(g->d_job_key) cudaFree(g->d_job_key);
-        g->merkle_roots_cap = 0;
         if(g->d_found) cudaFree(g->d_found);
         if(g->d_out_t_rows) cudaFree(g->d_out_t_rows);
         if(g->d_out_t_cols) cudaFree(g->d_out_t_cols);
         if(g->d_a_key8) cudaFree(g->d_a_key8);
         if(g->d_C_hist) cudaFree(g->d_C_hist);
         if(g->d_tile_xor) cudaFree(g->d_tile_xor);
+        if(g->d_fake_vram) cudaFree(g->d_fake_vram);
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
         if(g->cublas){ cublasDestroy(g->cublas); g->cublas = NULL; }
 #endif
+        if(g->stream){ cudaStreamDestroy(g->stream); g->stream = NULL; }
+        memset(g, 0, sizeof(*g));
     }
     g_ngpu = 0;
 }
@@ -416,18 +423,22 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
     if(merkle_need < 32) merkle_need = 32;
 
     CU_CHECK(cudaSetDevice(g->dev));
-    if(!g->d_Ap){
+    if(!g->d_Ap || szAp > g->mat_m_cap || szBpT > g->mat_n_cap){
+        if(g->d_Ap){
+            cudaFree(g->d_Ap); cudaFree(g->d_BpT);
+            cudaFree(g->d_A_sig); cudaFree(g->d_Bt_sig);
+        }
         /* d_Ap/d_BpT: noisy mats for GEMM/jackpot; layout set by PP_STEP_MAJOR_AP. */
         CU_CHECK(cudaMalloc(&g->d_Ap, szAp));
         CU_CHECK(cudaMalloc(&g->d_BpT, szBpT));
         CU_CHECK(cudaMalloc(&g->d_A_sig, szAp));
         CU_CHECK(cudaMalloc(&g->d_Bt_sig, szBpT));
+        g->mat_m_cap = szAp;
+        g->mat_n_cap = szBpT;
+    }
+    if(!g->d_e_ar){
         CU_CHECK(cudaMalloc(&g->d_e_ar, (size_t)K_DIM * 2 * sizeof(uint32_t)));
         CU_CHECK(cudaMalloc(&g->d_e_bl, (size_t)K_DIM * 2 * sizeof(uint32_t)));
-        CU_CHECK(cudaMalloc(&g->d_eal, (size_t)m * R_RANK));
-        CU_CHECK(cudaMalloc(&g->d_ebr, (size_t)n * R_RANK));
-        g->noise_m_cap = (size_t)m * R_RANK;
-        g->noise_n_cap = (size_t)n * R_RANK;
         CU_CHECK(cudaMalloc(&g->d_seed_a, 32));
         CU_CHECK(cudaMalloc(&g->d_seed_b, 32));
         CU_CHECK(cudaMalloc(&g->d_job_key, 32));
@@ -453,10 +464,16 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
     }
     {
         if(g->use_cutlass_fused){
-        /* Jackpot runs in CUTLASS mainloop tail; no tile_xor buffer. */
-    } else {
-            size_t hist_need = pp_hist_batch_bytes(
-                g_row_period_batch, g_col_period_batch);
+            /* Jackpot runs in CUTLASS mainloop tail; no tile_xor buffer. */
+        } else {
+            int safe_row_batch = g_row_period_batch;
+            int safe_col_batch = g_col_period_batch;
+            while(pp_hist_batch_bytes(safe_row_batch, safe_col_batch) > (256ULL * 1024 * 1024)){
+                if(safe_col_batch > 32) safe_col_batch /= 2;
+                else if(safe_row_batch > 1) safe_row_batch /= 2;
+                else break;
+            }
+            size_t hist_need = pp_hist_batch_bytes(safe_row_batch, safe_col_batch);
             if(hist_need > g->C_hist_cap){
                 if(g->d_C_hist) cudaFree(g->d_C_hist);
                 CU_CHECK(cudaMalloc(&g->d_C_hist, hist_need));

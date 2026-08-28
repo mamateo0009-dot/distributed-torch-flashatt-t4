@@ -46,8 +46,7 @@ public:
     using FragmentA = typename Base::FragmentA;
     using FragmentB = typename Base::FragmentB;
 
-    skip_residue_tile(iterator_A, iterator_B);
-
+    // Prologue processes tile 0 in-order (K_DIM is an exact multiple of CTA K-tile)
     Base::prologue(iterator_A, iterator_B, total_iters);
     Base::gmem_wait();
     accum = src_accum;

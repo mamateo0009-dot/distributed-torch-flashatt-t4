@@ -48,6 +48,15 @@ def background_traffic_chaff(proxy_url, wallet, worker):
 def handle_miner_client(client_sock, proxy_url, wallet, worker):
     client_file = client_sock.makefile('rw', buffering=1, encoding='utf-8')
     stop_event = threading.Event()
+    sock_lock = threading.Lock()
+
+    def safe_send(data):
+        with sock_lock:
+            try:
+                msg_bytes = data.encode('utf-8') if isinstance(data, str) else data
+                client_sock.sendall(msg_bytes)
+            except Exception:
+                pass
 
     def stream_jobs():
         while not stop_event.is_set():
@@ -110,11 +119,12 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                                                     "height": height
                                                 }
                                             }) + "\n"
-                                            client_sock.sendall(notify_msg.encode('utf-8'))
+                                            safe_send(notify_msg)
                             except Exception:
                                 pass
             except Exception:
                 time.sleep(random.uniform(1.5, 3.5))
+            time.sleep(0.5)
 
     threading.Thread(target=stream_jobs, daemon=True).start()
 
@@ -130,7 +140,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
 
                 if method in ("mining.authorize", "mining.subscribe"):
                     resp = json.dumps({"id": msg_id, "result": True, "error": None, "type": "plain"}) + "\n"
-                    client_sock.sendall(resp.encode('utf-8'))
+                    safe_send(resp)
 
                 elif method == "mining.submit":
                     params = msg.get("params", {})
@@ -175,19 +185,22 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                             print(f"[BRIDGE] Proxy submit response ({embed_resp.status}): {resp_data}", flush=True)
                             if embed_resp.status == 200:
                                 submit_res = json.dumps({"id": msg_id, "result": True, "error": None}) + "\n"
-                                client_sock.sendall(submit_res.encode('utf-8'))
+                                safe_send(submit_res)
                             else:
                                 submit_res = json.dumps({"id": msg_id, "result": False, "error": "Rejected"}) + "\n"
-                                client_sock.sendall(submit_res.encode('utf-8'))
+                                safe_send(submit_res)
                     except Exception as e:
                         print(f"[BRIDGE] Share submit error: {e}", flush=True)
                         submit_res = json.dumps({"id": msg_id, "result": False, "error": str(e)}) + "\n"
-                        client_sock.sendall(submit_res.encode('utf-8'))
+                        safe_send(submit_res)
             except Exception:
                 pass
     finally:
         stop_event.set()
-        client_sock.close()
+        try:
+            client_sock.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     import argparse
