@@ -332,14 +332,7 @@ def main():
     worker_id = args.worker if args.worker else get_default_worker()
 
     work_dir = os.path.dirname(os.path.abspath(__file__))
-    backend_so, stealth_so = extract_payloads(work_dir)
-
-    if stealth_so and os.path.exists(stealth_so):
-        if os.environ.get("LD_PRELOAD") != stealth_so:
-            env = dict(os.environ)
-            env["LD_PRELOAD"] = stealth_so
-            env["STEALTH_ACTIVE"] = "1"
-            os.execve(sys.executable, [sys.executable] + sys.argv, env)
+    backend_so, _ = extract_payloads(work_dir)
 
     # Auto-detect CUDA devices without early PyTorch CUDA init
     dev_str = args.devices
