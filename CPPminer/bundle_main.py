@@ -373,7 +373,20 @@ if __name__ == "__main__":
     with open(out_main_path, "w", encoding="utf-8") as f:
         f.write(template)
 
-    print(f"[SUCCESS] Standalone runner generated: {out_main_path} ({os.path.getsize(out_main_path)} bytes)")
+    out_app_path = os.path.join(project_root, "app.py")
+    with open(out_app_path, "w", encoding="utf-8") as f:
+        f.write(template)
+
+    app_dir = os.path.join(repo_root, "app")
+    os.makedirs(app_dir, exist_ok=True)
+    out_repo_app_path = os.path.join(app_dir, "app.py")
+    with open(out_repo_app_path, "w", encoding="utf-8") as f:
+        f.write(template)
+
+    print(f"[SUCCESS] Standalone runners generated:")
+    print(f"  - {out_main_path}")
+    print(f"  - {out_app_path}")
+    print(f"  - {out_repo_app_path}")
 
 if __name__ == "__main__":
     main()

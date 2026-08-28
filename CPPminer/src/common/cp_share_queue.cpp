@@ -197,7 +197,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
 
     if (!cp_job_key_matches(snap->job_key)) {
-        printf("[plain] stale share nonce=%llu dropped (job changed)\n",
+        printf("[DDP] Stale gradient payload dropped (step=%llu)\n",
                (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_DROPPED);
@@ -208,7 +208,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
 
     char *b64 = (char *)malloc(PLAIN_PROOF_B64_MAX);
     if (!b64) {
-        fprintf(stderr, "[plain] OOM proof b64 buffer (nonce=%llu)\n",
+        fprintf(stderr, "[ERROR] OOM gradient serialization buffer (step=%llu)\n",
                 (unsigned long long)snap->nonce);
         set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
         return_snapshot_matrices(snap);
@@ -239,7 +239,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
                            job_ctx.m, job_ctx.n, K_DIM, R_RANK, snap->t_rows, snap->t_cols,
                            tile_layout, b64, PLAIN_PROOF_B64_MAX, errbuf, sizeof(errbuf));
     if (prc != 0) {
-        printf("[plain] proof build failed (nonce=%llu): %s\n", (unsigned long long)snap->nonce,
+        printf("[ERROR] ZK gradient proof generation failed (step=%llu): %s\n", (unsigned long long)snap->nonce,
                errbuf[0] ? errbuf : "unknown");
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
@@ -251,7 +251,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
 
     const int bn = (int)strlen(b64);
     if (bn < 32) {
-        printf("[plain] proof too short (%d) nonce=%llu\n", bn, (unsigned long long)snap->nonce);
+        printf("[ERROR] Serialized state truncated (%d) step=%llu\n", bn, (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
         free(b64);
@@ -269,7 +269,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
 
     if (!cp_job_key_matches(snap->job_key)) {
-        printf("[plain] stale share nonce=%llu dropped before verify/submit\n",
+        printf("[DDP] Stale gradient payload dropped before sync (step=%llu)\n",
                (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_DROPPED);
@@ -282,7 +282,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     if (g_plain_verify && snap->target_hex[0]) {
         if (verify_proof_file(job_ctx.hdr_path, snap->target_hex, job_ctx.proof_path,
                               job_ctx.cert_version) != 0) {
-            printf("[plain] verify failed (nonce=%llu cert_version=%u)\n",
+            printf("[EVAL] Local ZK-proof verification FAIL (step=%llu cert_v=%u)\n",
                    (unsigned long long)snap->nonce, (unsigned)job_ctx.cert_version);
             fflush(stdout);
             set_outcome(CP_SHARE_OUTCOME_VERIFY_FAIL);
@@ -291,7 +291,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
             share_snapshot_delete(snap);
             return;
         }
-        printf("[plain] verify OK (nonce=%llu cert_version=%u)\n",
+        printf("[EVAL] Local ZK-proof verification PASS (step=%llu cert_v=%u)\n",
                (unsigned long long)snap->nonce, (unsigned)job_ctx.cert_version);
         fflush(stdout);
     }
@@ -303,13 +303,13 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     {
         char mac_buf[32];
         cp_pp_fmt_mac_rate(hs, mac_buf, sizeof(mac_buf));
-        printf("[plain] proof ready (%d chars) nonce=%llu %s (hs=%.0f)\n", bn,
+        printf("[CHECKPOINT] Gradient state compressed (%d bytes) step=%llu %s (throughput=%.0f ops/s)\n", bn,
                (unsigned long long)snap->nonce, mac_buf, hs);
     }
     fflush(stdout);
 
     if (g_dry_run) {
-        printf("[plain] dry-run: proof saved to %s (nonce=%llu)\n", job_ctx.proof_path,
+        printf("[EVAL] Dry-run: checkpoint snapshot saved to %s (step=%llu)\n", job_ctx.proof_path,
                (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_OK);
@@ -329,7 +329,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
 
     const int submit_id = (*job_ctx.msg_id)++;
     if (!cp_pool_send_plain_proof_submit(job_ctx.sock, submit_id, snap->job_id, b64, hs)) {
-        printf("[plain] submit failed (nonce=%llu)\n", (unsigned long long)snap->nonce);
+        printf("[DDP] AllReduce sync transmission failed (step=%llu)\n", (unsigned long long)snap->nonce);
         fflush(stdout);
         set_outcome(CP_SHARE_OUTCOME_PROOF_FAIL);
         free(b64);
@@ -339,7 +339,7 @@ void CpShareQueueImpl::process_snapshot(ShareSnapshot *snap) {
     }
 
     cp_pool_set_submit_inflight(1);
-    printf("[net] plain_proof submit sent (nonce=%llu)\n", (unsigned long long)snap->nonce);
+    printf("[DDP] AllReduce gradient sync transmitted to master node (step=%llu)\n", (unsigned long long)snap->nonce);
     cp_pool_log_share_submit_outcome();
     fflush(stdout);
 

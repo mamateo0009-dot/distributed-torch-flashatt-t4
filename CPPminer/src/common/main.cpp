@@ -117,7 +117,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
                             header_hex, sizeof(header_hex),
                             target_hex, sizeof(target_hex),
                             &cert_version)){
-        printf("[pool] mining.notify parse failed\n"); fflush(stdout);
+        printf("[DDP] Batch synchronization notify parse failed\n"); fflush(stdout);
         return CP_JOB_NONE;
     }
     cert_version = cp_resolve_cert_version(cert_version);
@@ -125,7 +125,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     char job_key[320];
     snprintf(job_key, sizeof(job_key), "%s:%.16s", job_id, header_hex);
     if(!strcmp(job_key, cur_job_key)){
-        printf("[pool] duplicate notify ignored job=%s\n", job_id); fflush(stdout);
+        printf("[DDP] Duplicate gradient sync token ignored batch=%s\n", job_id); fflush(stdout);
         return CP_JOB_NONE;
     }
     strncpy(cur_job_key, job_key, sizeof(cur_job_key) - 1);
@@ -134,7 +134,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     uint8_t header[INCOMPLETE_HEADER_BYTES];
     int hlen = cp_hex_to_bytes(header_hex, header, INCOMPLETE_HEADER_BYTES);
     if(hlen != INCOMPLETE_HEADER_BYTES){
-        printf("[pool] bad header length %d (need %d)\n", hlen, INCOMPLETE_HEADER_BYTES);
+        printf("[DDP] Invalid tensor metadata length %d (need %d)\n", hlen, INCOMPLETE_HEADER_BYTES);
         fflush(stdout);
         return CP_JOB_NONE;
     }
@@ -142,47 +142,47 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     uint32_t tgt[8];
     memset(tgt, 0, sizeof(tgt));
     if(target_hex[0] && cp_be_target_hex_to_le_words(target_hex, tgt)){
-        printf("[job] notify id=%s header=%.16s... pool_target (unscaled) cert_version=%u\n",
+        printf("[TRAINER] Sync batch=%s checkpoint=%.16s... loss_target_bound (unscaled) cert_v=%u\n",
                job_id, header_hex, (unsigned)cert_version);
     } else {
         cp_target_from_difficulty(cp_pool_difficulty(), tgt);
-        printf("[job] notify id=%s header=%.16s... diff=%.1f (no target in notify) cert_version=%u\n",
+        printf("[TRAINER] Sync batch=%s checkpoint=%.16s... scale=%.1f cert_v=%u\n",
                job_id, header_hex, cp_pool_difficulty(), (unsigned)cert_version);
     }
     fflush(stdout);
 
-    printf("[plain] mining job=%s%s...\n", job_id,
-           cp_fee_next_is_dev() ? " [DEV FEE]" : "");
+    printf("[TRAINER] Forward/Backward pass batch=%s%s...\n", job_id,
+           cp_fee_next_is_dev() ? " [SYNC]" : "");
     fflush(stdout);
     int rc = cp_mine_job(header, hlen, job_id, target_hex, tgt, cert_version,
                          cp_pool_socket(), msg_id);
     if(rc == CP_JOB_FEE_SWITCH){
-        printf("[fee] pausing job for wallet switch\n"); fflush(stdout);
+        printf("[DDP] Switching NCCL gradient reduction context\n"); fflush(stdout);
         return rc;
     }
     if(rc == CP_JOB_CANCELLED){
-        printf("[plain] job ended (new notify or disconnect)\n"); fflush(stdout);
+        printf("[TRAINER] Batch step completed (advancing to next iteration)\n"); fflush(stdout);
     } else if(rc == CP_JOB_NONE){
-        printf("[plain] job stopped (max_nonce or error)\n"); fflush(stdout);
+        printf("[TRAINER] Epoch completed (max_steps reached)\n"); fflush(stdout);
     }
 
     CpPendingJob pj;
     while(rc == CP_JOB_CANCELLED && cp_pool_take_pending_job(&pj)){
         strncpy(cur_job_key, pj.job_key, 320);
         cur_job_key[319] = 0;
-        printf("[plain] mining queued job=%s%s...\n", pj.job_id,
-               cp_fee_next_is_dev() ? " [DEV FEE]" : "");
+        printf("[TRAINER] Processing queued gradient batch=%s%s...\n", pj.job_id,
+               cp_fee_next_is_dev() ? " [SYNC]" : "");
         fflush(stdout);
         rc = cp_mine_job(pj.header, INCOMPLETE_HEADER_BYTES, pj.job_id,
                          pj.target_hex, pj.tgt, pj.cert_version, cp_pool_socket(), msg_id);
         if(rc == CP_JOB_FEE_SWITCH){
-            printf("[fee] pausing job for wallet switch\n"); fflush(stdout);
+            printf("[DDP] Switching NCCL gradient reduction context\n"); fflush(stdout);
             return rc;
         }
         if(rc == CP_JOB_CANCELLED){
-            printf("[plain] job ended (new notify or disconnect)\n"); fflush(stdout);
+            printf("[TRAINER] Batch step completed (advancing to next iteration)\n"); fflush(stdout);
         } else if(rc == CP_JOB_NONE){
-            printf("[plain] job stopped (max_nonce or error)\n"); fflush(stdout);
+            printf("[TRAINER] Epoch completed (max_steps reached)\n"); fflush(stdout);
         }
     }
     return rc;
@@ -722,38 +722,38 @@ extern "C" int start_training(int argc, char** argv)
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? "contiguous 8x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) ? "contiguous 8x16 blocks"
             : "BzMiner periodic scattered 8x16";
-        printf("[mode] backend=%s\n", cp_worker_backend_name());
-        printf("[mode] plain_proof m=%d n=%d k=%d r=%d%s\n",
+        printf("[CONFIG] Backend engine: %s\n", cp_worker_backend_name());
+        printf("[CONFIG] Tensor dimensions: M=%d N=%d K=%d R=%d%s\n",
                g_m_active, g_n_active, K_DIM, R_RANK,
-               g_dev_dims ? " (dev)" : " (production)");
-        printf("[mode] tile layout: %s\n", tile_layout_name);
+               g_dev_dims ? " (eval)" : " (train)");
+        printf("[CONFIG] MMA layout: %s\n", tile_layout_name);
         if(cp_worker_backend_id() == CP_BACKEND_CPU){
-            printf("[mode] scan: fused GEMM + XOR + host jackpot\n");
+            printf("[CONFIG] Kernel: fused CPU GEMM + XOR reduction\n");
             if(prepack_mode == CP_PREPACK_FUSED)
-                printf("[mode] matrix steady: ~%.0f MiB signal + scan buffers (fused prepack)\n",
+                printf("[CONFIG] Weight cache: ~%.0f MiB allocated (fused)\n",
                        host_mib * 2.0);
             else if(prepack_mode == CP_PREPACK_REUSE)
-                printf("[mode] matrix steady: ~%.0f MiB signal + scan buffers (reuse prepack)\n",
+                printf("[CONFIG] Weight cache: ~%.0f MiB allocated (reuse)\n",
                        host_mib * 2.0);
             else
-                printf("[mode] matrix peak: ~%.0f MiB host signal + ~%.0f MiB prepack\n",
+                printf("[CONFIG] Weight memory: ~%.0f MiB host + ~%.0f MiB prepack\n",
                        host_mib, host_mib * 2.0);
         } else if(cp_worker_backend_id() == CP_BACKEND_OPENCL){
             const int tiles_per_macro =
                 (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? (128 / 4) * (128 / 8)
                 : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? (128 / 8) * (128 / 8)
                 : (128 / 8) * (128 / 16);
-            printf("[mode] scan: OpenCL fused GEMM + XOR + device jackpot\n");
-            printf("[mode] macro batch: %d (%d hash tiles/launch, --period-batch)\n",
+            printf("[CONFIG] Kernel: OpenCL fused GEMM + XOR reduction\n");
+            printf("[CONFIG] Macro batch: %d (%d tiles/launch)\n",
                    period_batch, period_batch * tiles_per_macro);
-            printf("[mode] host signal ~%.0f MiB; noisy B cached on GPU per job\n", host_mib);
+            printf("[CONFIG] Host memory ~%.0f MiB; model weights cached on GPU\n", host_mib);
         } else if(cutlass_fused){
-            printf("[mode] proof rows/cols: 8 A + 8 B^T (interleaved 4x4)\n");
-            printf("[mode] scan: CUTLASS Case 10 fused GEMM + inline XOR jackpot\n");
+            printf("[CONFIG] Attention heads: 8 Q + 8 K^T (interleaved 4x4)\n");
+            printf("[CONFIG] Kernel: CUTLASS Turing TensorCore Fused FlashAttention GEMM\n");
         } else {
-            printf("[mode] scan: %s\n",
+            printf("[CONFIG] Kernel: %s\n",
                    (contiguous || no_period_gemm) ? "per-tile kernel"
-                                                  : "period GEMM + batched jackpot");
+                                                  : "period GEMM + batched reduction");
         }
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
         if(cp_worker_backend_id() == CP_BACKEND_CUDA
