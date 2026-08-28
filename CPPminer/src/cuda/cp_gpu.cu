@@ -294,7 +294,10 @@ int cp_gpu_default_tile_layout(void)
 {
     if (g_cutlass_fused) {
         int dev = 0;
-        cudaGetDevice(&dev);
+        if (cudaGetDevice(&dev) != cudaSuccess) {
+            cudaGetLastError();
+            dev = 0;
+        }
         if (cp_cutlass_is_tensorop_supported(dev)) {
             return CP_TILE_LAYOUT_CUTLASS_TENSOROP;
         }
