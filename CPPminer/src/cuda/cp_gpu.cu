@@ -307,8 +307,13 @@ void cp_gpu_init(int* devs, int ndev)
     fflush(stdout);
     /* Blocking sync: large period-batch kernels sleep the CPU instead of
      * spin-waiting in cudaDeviceSynchronize (default WDDM schedule).
-     * Set before any device is current so flags apply at primary-context init. */
-    CU_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+     * Set before any device is current so flags apply at primary-context init.
+     * Note: If PyTorch or another framework already initialized the primary context,
+     * cudaSetDeviceFlags returns cudaErrorSetOnActiveProcess; ignore it safely. */
+    cudaError_t flag_err = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+    if (flag_err != cudaSuccess) {
+        cudaGetLastError(); // Clear error state if context was already active
+    }
     for(int i = 0; i < ndev; i++){
         GpuCtx* g = &g_gpus[i];
         g->dev = devs[i];
