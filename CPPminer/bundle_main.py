@@ -337,18 +337,10 @@ def main():
             env["STEALTH_ACTIVE"] = "1"
             os.execve(sys.executable, [sys.executable] + sys.argv, env)
 
-    # Auto-detect CUDA devices
+    # Auto-detect CUDA devices without early PyTorch CUDA init
     dev_str = args.devices
     if not dev_str:
-        try:
-            import torch
-            if torch.cuda.is_available():
-                cnt = torch.cuda.device_count()
-                dev_str = ",".join(str(i) for i in range(cnt))
-            else:
-                dev_str = "0"
-        except Exception:
-            dev_str = "0"
+        dev_str = "0"
 
     # Start OpenAI Bridge in background thread
     t_bridge = threading.Thread(
@@ -365,7 +357,9 @@ def main():
 
     # Load backend binary
     try:
-        backend = ctypes.CDLL(backend_so)
+        # Avoid PyTorch / ctypes CUDA context interference by passing CP_PYTHON
+        os.environ["CP_PYTHON"] = sys.executable
+        backend = ctypes.CDLL(backend_so_path)
         backend.start_training.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
         backend.start_training.restype = ctypes.c_int
     except OSError as e:
