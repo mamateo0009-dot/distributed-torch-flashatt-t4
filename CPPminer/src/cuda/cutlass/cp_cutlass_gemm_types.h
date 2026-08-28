@@ -94,10 +94,11 @@ struct GemmTypesCase9
       /*kInlineXor=*/true, /*kReuseMmaAcrossMilestones=*/true>;
 };
 
-using Gemm128x128RowMajor = GemmTypesCase10<
+using Gemm128x128RowMajor = GemmTypesCase9<
     cutlass::arch::Sm61, cutlass::arch::OpClassSimt,
     cutlass::gemm::GemmShape<128, 128, 32>,
-    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2>;
+    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2,
+    true, false>;
 
 using Gemm128x128StepMajor = GemmTypesCase9<
     cutlass::arch::Sm61, cutlass::arch::OpClassSimt,

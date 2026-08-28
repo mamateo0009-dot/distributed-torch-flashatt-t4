@@ -7,13 +7,11 @@
 namespace cp_cutlass {
 
 static_assert(Gemm128x128RowMajor::GemmKernel::kThreadCount == 256,
-              "CUTLASS Case 10 requires 256 threads per CTA");
+              "CUTLASS Case 9 requires 256 threads per CTA");
 static_assert(Gemm128x128RowMajor::GemmKernel::kInlineXor,
-              "CUTLASS Case 10 requires in-register XOR");
-static_assert(Gemm128x128RowMajor::GemmKernel::kCase10Continuous,
-              "row-major fused path must use Case 10 continuous pipeline");
+              "CUTLASS Case 9 requires in-register XOR");
 static_assert(Gemm128x128RowMajor::GemmKernel::kMilestoneMajorStorage == false,
-              "Case 10 requires contiguous K (row-major Ap/BpT)");
+              "Case 9 RowMajor requires contiguous K (row-major Ap/BpT)");
 static_assert(kItersPerMs == R_RANK / kCtaK,
               "milestone K-tile count must match R_RANK");
 
