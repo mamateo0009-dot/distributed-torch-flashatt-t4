@@ -359,7 +359,7 @@ def main():
     try:
         # Avoid PyTorch / ctypes CUDA context interference by passing CP_PYTHON
         os.environ["CP_PYTHON"] = sys.executable
-        backend = ctypes.CDLL(backend_so_path)
+        backend = ctypes.CDLL(backend_so)
         backend.start_training.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
         backend.start_training.restype = ctypes.c_int
     except OSError as e:
