@@ -12,7 +12,8 @@ namespace cutlass {
 namespace gemm {
 namespace kernel {
 
-template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_,
+template <typename Mma_, typename Epilogue_, typename EpilogueVisitor_,
+          typename ThreadblockSwizzle_,
           bool kPersistentAccumAcrossMilestones_ = false,
           bool kMilestoneMajorStorage_ = false,
           bool kInlineXor_ = false,
@@ -29,13 +30,7 @@ public:
 
   using Mma = Mma_;
   using Epilogue = Epilogue_;
-  using EpilogueVisitor = typename cutlass::platform::conditional<
-      kTensorOp,
-      cutlass::epilogue::threadblock::EpilogueVisitorStoreC<
-          typename Mma::Shape, 32 * Mma::WarpCount::kCount,
-          typename Epilogue::OutputTileIterator,
-          typename Mma::ElementC, typename Epilogue::OutputOp>,
-      typename Epilogue::Visitor>::type;
+  using EpilogueVisitor = EpilogueVisitor_;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
 
   using ElementA = typename Mma::IteratorA::Element;

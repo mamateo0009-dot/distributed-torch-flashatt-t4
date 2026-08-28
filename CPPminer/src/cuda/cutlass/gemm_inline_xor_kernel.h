@@ -14,20 +14,15 @@ namespace gemm {
 namespace kernel {
 
 template <typename MmaMilestone_, typename Epilogue_,
-          typename ThreadblockSwizzle_, bool kTensorOp_ = false>
+          typename EpilogueVisitor_, typename ThreadblockSwizzle_,
+          bool kTensorOp_ = false>
 struct InlineXorKernel {
 public:
   using Mma = MmaMilestone_;
   using BaseMma = typename Mma::Base;
   using Epilogue = Epilogue_;
   static bool const kTensorOp = kTensorOp_;
-  using EpilogueVisitor = typename cutlass::platform::conditional<
-      kTensorOp,
-      cutlass::epilogue::threadblock::EpilogueVisitorStoreC<
-          typename BaseMma::Shape, 32 * BaseMma::WarpCount::kCount,
-          typename Epilogue::OutputTileIterator,
-          typename BaseMma::ElementC, typename Epilogue::OutputOp>,
-      typename Epilogue::Visitor>::type;
+  using EpilogueVisitor = EpilogueVisitor_;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
 
   /* Traits expected by FusedMilestoneGemmOp / layout asserts. */
