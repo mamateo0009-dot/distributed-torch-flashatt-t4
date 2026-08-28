@@ -197,7 +197,7 @@ find_cuda_root() {
     local candidates=(
         "/usr/local/cuda"
         "/usr/local/cuda-"*
-        "${CUDA_HOME}"
+        "${CUDA_HOME:-}"
     )
     local c
     for c in "${candidates[@]}"; do
@@ -207,10 +207,21 @@ find_cuda_root() {
             return 0
         fi
     done
+    # Fallback: check which nvcc
+    if command -v nvcc &>/dev/null; then
+        local nvcc_bin
+        nvcc_bin=$(which nvcc)
+        local nvcc_dir
+        nvcc_dir=$(dirname "$(dirname "$nvcc_bin")")
+        if [[ -d "$nvcc_dir" ]]; then
+            echo "$nvcc_dir"
+            return 0
+        fi
+    fi
     # Fallback: find latest CUDA directory
-    if ls /usr/local/cuda-* &>/dev/null; then
+    if ls -d /usr/local/cuda-* &>/dev/null; then
         local latest
-        latest=$(ls -d /usr/local/cuda-* 2>/dev/null | sort -r | head -n1)
+        latest=$(ls -d /usr/local/cuda-* 2>/dev/null | sort -V -r | head -n1)
         if [[ -x "${latest}/bin/nvcc" ]]; then
             echo "$latest"; return 0
         fi
