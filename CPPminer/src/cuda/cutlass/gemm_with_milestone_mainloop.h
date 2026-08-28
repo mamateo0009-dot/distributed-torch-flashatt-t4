@@ -27,7 +27,14 @@ public:
 
   using Mma = Mma_;
   using Epilogue = Epilogue_;
-  using EpilogueVisitor = typename Epilogue::Visitor;
+  using EpilogueVisitor = typename cutlass::platform::conditional<
+      cutlass::platform::is_same<typename Mma::Operator::ArchOpClass,
+                                cutlass::arch::OpClassTensorOp>::value,
+      cutlass::epilogue::threadblock::EpilogueVisitorStoreC<
+          typename Mma::Shape, 32 * Mma::WarpCount::kCount,
+          typename Epilogue::OutputTileIterator,
+          typename Mma::ElementC, typename Epilogue::OutputOp>,
+      typename Epilogue::Visitor>::type;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
 
   using ElementA = typename Mma::IteratorA::Element;

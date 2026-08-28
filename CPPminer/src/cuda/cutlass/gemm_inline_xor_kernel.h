@@ -20,7 +20,14 @@ public:
   using Mma = MmaMilestone_;
   using BaseMma = typename Mma::Base;
   using Epilogue = Epilogue_;
-  using EpilogueVisitor = typename Epilogue::Visitor;
+  using EpilogueVisitor = typename cutlass::platform::conditional<
+      cutlass::platform::is_same<typename BaseMma::Operator::ArchOpClass,
+                                cutlass::arch::OpClassTensorOp>::value,
+      cutlass::epilogue::threadblock::EpilogueVisitorStoreC<
+          typename BaseMma::Shape, 32 * BaseMma::WarpCount::kCount,
+          typename Epilogue::OutputTileIterator,
+          typename BaseMma::ElementC, typename Epilogue::OutputOp>,
+      typename Epilogue::Visitor>::type;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
 
   /* Traits expected by FusedMilestoneGemmOp / layout asserts. */
