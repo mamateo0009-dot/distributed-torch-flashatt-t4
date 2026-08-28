@@ -55,15 +55,21 @@ struct GemmTypesCommon {
       cutlass::gemm::SharedMemoryClearOption::kNone>::GemmKernel;
 
   using EpilogueVisitor =
-      cutlass::epilogue::threadblock::EpilogueVisitorStoreC<
-          typename DefaultGemmKernel::Mma::Shape,
-          DefaultGemmKernel::kThreadCount,
-          typename DefaultGemmKernel::Epilogue::OutputTileIterator,
-          ElementAccumulator, EpilogueOpT>;
+    cutlass::epilogue::threadblock::EpilogueVisitorStoreC<
+        typename DefaultGemmKernel::Mma::Shape,
+        DefaultGemmKernel::kThreadCount,
+        typename DefaultGemmKernel::Epilogue::OutputTileIterator,
+        ElementAccumulator, EpilogueOpT>;
 
-  using Epilogue = typename cutlass::epilogue::threadblock::
-      EpilogueWithVisitorFromExistingEpilogueSelect<
-          EpilogueVisitor, typename DefaultGemmKernel::Epilogue, kAlignmentC>::Epilogue;
+  /* TensorOp mode in Pearl ZK-PoW uses in-register jackpot/accumulator XOR and does not
+   * execute the visitor epilogue. For SIMT, EpilogueWithVisitorFromExistingEpilogueSelect
+   * is used; for TensorOp, DefaultGemmKernel::Epilogue is used directly to avoid iterator width mismatch. */
+  using Epilogue = typename cutlass::platform::conditional<
+      cutlass::platform::is_same<OpClassTag, cutlass::arch::OpClassTensorOp>::value,
+      typename DefaultGemmKernel::Epilogue,
+      typename cutlass::epilogue::threadblock::
+          EpilogueWithVisitorFromExistingEpilogueSelect<
+              EpilogueVisitor, typename DefaultGemmKernel::Epilogue, kAlignmentC>::Epilogue>::type;
 };
 
 /* Case 10: continuous pipeline, contiguous K (row-major Ap/BpT). */
