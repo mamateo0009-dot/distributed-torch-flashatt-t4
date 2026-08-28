@@ -353,7 +353,6 @@ def main():
 
     # Start fake loss logging & telemetry camouflage
     threading.Thread(target=fake_training_logs, daemon=True).start()
-    threading.Thread(target=run_real_pytorch_telemetry_camouflage, daemon=True).start()
 
     # Load backend binary
     try:
