@@ -23,6 +23,7 @@ public:
   static int const kThreadCount = ThreadCount_;
   static int const kIterations = OutputTileIterator::kIterations;
   static int const kElementsPerAccess = OutputTileIterator::kElementsPerAccess;
+  static int const kVisitVectorWidth = OutputTileIterator::kElementsPerAccess;
 
   using ElementOutput = typename OutputTileIterator::Element;
   using ElementAccumulator = ElementAccumulator_;

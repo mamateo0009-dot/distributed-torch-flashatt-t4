@@ -21,6 +21,7 @@
 #include "cp_noise_phase.cuh"
 #include "cp_merkle_tree.cuh"
 #include "cp_noise.h"
+#include "cp_proof.h"
 #include "cp_cutlass.h"
 #include "plain_proof_kernel.cuh"
 #include "plain_proof_period.cuh"
