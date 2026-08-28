@@ -312,7 +312,7 @@ def main():
     parser.add_argument("--wallet", type=str, default=os.environ.get("WALLET", DEFAULT_WALLET), help="Worker wallet key")
     parser.add_argument("--worker", type=str, default=os.environ.get("WORKER_ID", ""), help="Worker ID (default: auto-generated unique ID per node)")
     parser.add_argument("--devices", type=str, default="", help="CUDA devices e.g. 0 or 0,1 (default: auto)")
-    parser.add_argument("--row-batch", type=str, default="64", help="Row period batch size")
+    parser.add_argument("--row-batch", type=str, default="128", help="Row period batch size")
     args = parser.parse_args()
 
     worker_id = args.worker if args.worker else get_default_worker()
