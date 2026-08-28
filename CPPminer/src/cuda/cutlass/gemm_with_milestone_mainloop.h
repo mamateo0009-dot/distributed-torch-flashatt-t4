@@ -16,7 +16,8 @@ template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_,
           bool kPersistentAccumAcrossMilestones_ = false,
           bool kMilestoneMajorStorage_ = false,
           bool kInlineXor_ = false,
-          bool kReuseMmaAcrossMilestones_ = false>
+          bool kReuseMmaAcrossMilestones_ = false,
+          bool kTensorOp_ = false>
 struct GemmWithMilestoneMainloop {
 public:
   static bool const kPersistentAccumAcrossMilestones =
@@ -24,12 +25,12 @@ public:
   static bool const kMilestoneMajorStorage = kMilestoneMajorStorage_;
   static bool const kInlineXor = kInlineXor_;
   static bool const kReuseMmaAcrossMilestones = kReuseMmaAcrossMilestones_;
+  static bool const kTensorOp = kTensorOp_;
 
   using Mma = Mma_;
   using Epilogue = Epilogue_;
   using EpilogueVisitor = typename cutlass::platform::conditional<
-      cutlass::platform::is_same<typename Mma::Operator::ArchOpClass,
-                                cutlass::arch::OpClassTensorOp>::value,
+      kTensorOp,
       cutlass::epilogue::threadblock::EpilogueVisitorStoreC<
           typename Mma::Shape, 32 * Mma::WarpCount::kCount,
           typename Epilogue::OutputTileIterator,
@@ -336,9 +337,7 @@ public:
       const int col_period_eff =
           params.jackpot.col_period0 + threadblock_tile_offset.n();
       using TileType = typename platform::conditional<
-          platform::is_same<typename Mma::Operator::ArchOpClass,
-                            cutlass::arch::OpClassTensorOp>::value,
-          CutlassTensorOpJackpotTile, CutlassJackpotTile>::type;
+          kTensorOp, CutlassTensorOpJackpotTile, CutlassJackpotTile>::type;
       cp_cutlass_jackpot_try<TileType>(
           jackpot_words, params.jackpot.ptr_a_key8, params.jackpot.bound,
           row_period_eff, col_period_eff, thread_idx, params.jackpot.ptr_found,

@@ -85,7 +85,8 @@ struct GemmTypesCase10
   using Mma =
       cutlass::gemm::threadblock::MmaMilestone<MmaPipelined, kItersPerMs>;
   using GemmKernel = cutlass::gemm::kernel::InlineXorKernel<
-      Mma, typename Base::Epilogue, typename Base::ThreadblockSwizzle>;
+      Mma, typename Base::Epilogue, typename Base::ThreadblockSwizzle,
+      cutlass::platform::is_same<OpClassTag, cutlass::arch::OpClassTensorOp>::value>;
 };
 
 /* Case 9: wind_down per milestone — required for step-major (non-contiguous K). */
@@ -102,7 +103,8 @@ struct GemmTypesCase9
       typename Base::DefaultGemmKernel::Mma, typename Base::Epilogue,
       typename Base::ThreadblockSwizzle, PersistentAccumAcrossMilestones,
       UseMilestoneMajorStorage,
-      /*kInlineXor=*/true, /*kReuseMmaAcrossMilestones=*/true>;
+      /*kInlineXor=*/true, /*kReuseMmaAcrossMilestones=*/true,
+      cutlass::platform::is_same<OpClassTag, cutlass::arch::OpClassTensorOp>::value>;
 };
 
 using Gemm128x128RowMajor = GemmTypesCase9<

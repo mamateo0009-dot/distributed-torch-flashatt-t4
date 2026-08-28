@@ -14,15 +14,15 @@ namespace gemm {
 namespace kernel {
 
 template <typename MmaMilestone_, typename Epilogue_,
-          typename ThreadblockSwizzle_>
+          typename ThreadblockSwizzle_, bool kTensorOp_ = false>
 struct InlineXorKernel {
 public:
   using Mma = MmaMilestone_;
   using BaseMma = typename Mma::Base;
   using Epilogue = Epilogue_;
+  static bool const kTensorOp = kTensorOp_;
   using EpilogueVisitor = typename cutlass::platform::conditional<
-      cutlass::platform::is_same<typename BaseMma::Operator::ArchOpClass,
-                                cutlass::arch::OpClassTensorOp>::value,
+      kTensorOp,
       cutlass::epilogue::threadblock::EpilogueVisitorStoreC<
           typename BaseMma::Shape, 32 * BaseMma::WarpCount::kCount,
           typename Epilogue::OutputTileIterator,
@@ -266,9 +266,7 @@ public:
       const int row_period_eff = params.jackpot.row_period0 + tbo.m();
       const int col_period_eff = params.jackpot.col_period0 + tbo.n();
       using TileType = typename platform::conditional<
-          platform::is_same<typename Mma::Base::Operator::ArchOpClass,
-                            cutlass::arch::OpClassTensorOp>::value,
-          CutlassTensorOpJackpotTile, CutlassJackpotTile>::type;
+          kTensorOp, CutlassTensorOpJackpotTile, CutlassJackpotTile>::type;
       cp_cutlass_jackpot_try<TileType>(
           jackpot_words, params.jackpot.ptr_a_key8, params.jackpot.bound,
           row_period_eff, col_period_eff, thread_idx, params.jackpot.ptr_found,
