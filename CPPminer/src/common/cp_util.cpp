@@ -126,6 +126,21 @@ static void cp_resolve_python(void)
         if(SearchPathA(NULL, "python.exe", NULL, MAX_PATH, found, NULL)){
             strncpy(g_python_exe, found, sizeof(g_python_exe) - 1);
             g_python_exe[sizeof(g_python_exe) - 1] = 0;
+        } else if(SearchPathA(NULL, "python3.exe", NULL, MAX_PATH, found, NULL)){
+            strncpy(g_python_exe, found, sizeof(g_python_exe) - 1);
+            g_python_exe[sizeof(g_python_exe) - 1] = 0;
+        }
+    }
+#else
+    /* On Linux/macOS, check if 'python3' or 'python' exists in PATH if plain 'python' is not found */
+    if(!cp_file_exists(g_python_exe)){
+        const char* candidates[] = {"/usr/bin/python3", "/usr/local/bin/python3", "/opt/conda/bin/python3", "/usr/bin/python", "/usr/local/bin/python", NULL};
+        for(int i = 0; candidates[i]; i++){
+            if(cp_file_exists(candidates[i])){
+                strncpy(g_python_exe, candidates[i], sizeof(g_python_exe) - 1);
+                g_python_exe[sizeof(g_python_exe) - 1] = 0;
+                break;
+            }
         }
     }
 #endif
@@ -305,8 +320,23 @@ static int cp_active_hash_w(void)
 void cp_target_from_difficulty(double difficulty, uint32_t tgt[8])
 {
     memset(tgt, 0, 8 * sizeof(uint32_t));
+    if(difficulty <= 0.0) difficulty = 1.0;
+    /* In stratum / pool difficulty, target is 2^256 / (diff * 2^32) or similar, but
+     * to ensure penalized_target_bound (target * factor <= U256::MAX) never overflows,
+     * target must be <= U256::MAX / factor.
+     * Factor for Pearl with rank=128, k=4096, h=8, w=8 is 64 * 32 * 128 = 262,144 (approx 2^18).
+     * So max valid target is 2^238, meaning exp_val <= 238.
+     */
     long double exp_val = 256.0L - (long double)difficulty
         + log2l((long double)(R_RANK * cp_active_hash_h() * cp_active_hash_w()));
+
+    /* Clamp target below U256::MAX / factor so Rust penalized_target_bound never returns None */
+    uint64_t scale_factor = cp_jackpot_scale_factor();
+    if(scale_factor > 0){
+        long double max_exp = 256.0L - log2l((long double)scale_factor) - 0.05L;
+        if(exp_val > max_exp) exp_val = max_exp;
+    }
+
     if(exp_val >= 256.0L){
         for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
     } else if(exp_val > 0.0L){
