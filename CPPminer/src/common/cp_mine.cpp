@@ -248,8 +248,6 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             }
             fflush(stdout);
         }
-            fflush(stdout);
-        }
 
         uint64_t scan_tiles = 0;
         const int worker_cpu_prep =

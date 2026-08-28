@@ -189,11 +189,10 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
 }
 
 #ifdef _WIN32
-__declspec(dllexport)
+__declspec(dllexport) int start_training(int argc, char** argv)
 #else
-__attribute__((visibility("default")))
+extern "C" __attribute__((visibility("default"))) int start_training(int argc, char** argv)
 #endif
-extern "C" int start_training(int argc, char** argv)
 {
     const char* pool_host = "pearl-cpu-eu1.luckypool.io";
     int pool_port = 3370;
