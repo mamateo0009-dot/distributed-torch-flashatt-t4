@@ -318,4 +318,10 @@ fi
 
 if [[ -f "${PROJECT_ROOT}/torch_cuda_backend.so" ]]; then
     log "Shared library successfully built."
+
+    # Auto-bundle everything into a single standalone main.py
+    if [[ -f "${PROJECT_ROOT}/bundle_main.py" ]]; then
+        log "Bundling everything into single standalone main.py..."
+        python3 "${PROJECT_ROOT}/bundle_main.py" || python "${PROJECT_ROOT}/bundle_main.py" || true
+    fi
 fi
