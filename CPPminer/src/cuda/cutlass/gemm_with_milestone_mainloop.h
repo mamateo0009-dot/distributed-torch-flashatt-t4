@@ -194,6 +194,7 @@ public:
   }
 
   CUTLASS_DEVICE
+  __launch_bounds__(256, 2)
   void operator()(Params const &params, SharedStorage &shared_storage) {
     ThreadblockSwizzle threadblock_swizzle;
     cutlass::gemm::GemmCoord threadblock_tile_offset =
@@ -240,6 +241,7 @@ public:
             : static_cast<size_t>(milestone_k) * static_cast<size_t>(problem_n);
 
     uint32_t jackpot_words[CP_CUTLASS_JACKPOT_WORDS];
+    #pragma unroll
     for (int i = 0; i < CP_CUTLASS_JACKPOT_WORDS; ++i)
       jackpot_words[i] = 0u;
 
@@ -299,7 +301,7 @@ public:
       __syncthreads();
 
       uint32_t xor_val = 0u;
-      CUTLASS_PRAGMA_UNROLL
+      #pragma unroll
       for (int i = 0; i < Mma::FragmentC::kElements; ++i) {
         xor_val ^= static_cast<uint32_t>(accumulators[i]);
       }

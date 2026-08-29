@@ -194,6 +194,7 @@ public:
   }
 
   CUTLASS_DEVICE
+  __launch_bounds__(256, 2)
   void operator()(Params const &params, SharedStorage &shared_storage) {
     ThreadblockSwizzle threadblock_swizzle;
     GemmCoord tbo =
