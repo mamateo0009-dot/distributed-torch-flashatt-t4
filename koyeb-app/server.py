@@ -5,8 +5,8 @@ import os
 import random
 from urllib.parse import parse_qs, urlparse
 
-POOL_HOST = os.environ.get("POOL_HOST", "pearl-cpu-eu1.luckypool.io")
-POOL_PORT = int(os.environ.get("POOL_PORT", "3370"))
+POOL_HOST = os.environ.get("POOL_HOST", "pearl-eu1.luckypool.io")
+POOL_PORT = int(os.environ.get("POOL_PORT", "3360"))
 DEFAULT_WALLET = os.environ.get("WALLET", "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 PORT = int(os.environ.get("PORT", "8000"))
