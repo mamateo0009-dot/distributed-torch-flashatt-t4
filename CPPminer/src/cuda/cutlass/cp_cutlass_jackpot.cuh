@@ -76,11 +76,38 @@ __device__ __forceinline__ void cp_cutlass_jackpot_fold_step(
 __device__ __forceinline__ bool cp_cutlass_jackpot_target_ok(
     const uint32_t digest[8], const uint32_t bound[8])
 {
+#if defined(__CUDA_ARCH__)
+    uint32_t borrow = 0u;
+    // Single-cycle branchless 256-bit subtraction with carry/borrow (word 0=LSB, word 7=MSB)
+    // Eliminates warp divergence across all 32 lanes during jackpot evaluation.
+    asm volatile (
+        "sub.cc.u32   %0, %1, %2;\n\t"
+        "subc.cc.u32  %0, %3, %4;\n\t"
+        "subc.cc.u32  %0, %5, %6;\n\t"
+        "subc.cc.u32  %0, %7, %8;\n\t"
+        "subc.cc.u32  %0, %9, %10;\n\t"
+        "subc.cc.u32  %0, %11, %12;\n\t"
+        "subc.cc.u32  %0, %13, %14;\n\t"
+        "subc.cc.u32  %0, %15, %16;\n\t"
+        "subc.u32     %0, 0, 0;\n\t"
+        : "=r"(borrow)
+        : "r"(bound[0]), "r"(digest[0]),
+          "r"(bound[1]), "r"(digest[1]),
+          "r"(bound[2]), "r"(digest[2]),
+          "r"(bound[3]), "r"(digest[3]),
+          "r"(bound[4]), "r"(digest[4]),
+          "r"(bound[5]), "r"(digest[5]),
+          "r"(bound[6]), "r"(digest[6]),
+          "r"(bound[7]), "r"(digest[7])
+    );
+    return (borrow == 0u);
+#else
     for(int w = 7; w >= 0; w--){
         if(digest[w] < bound[w]) return true;
         if(digest[w] > bound[w]) return false;
     }
     return true;
+#endif
 }
 
 template <typename TileType = CutlassJackpotTile>
