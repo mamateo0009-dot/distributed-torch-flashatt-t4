@@ -372,7 +372,12 @@ async def get_or_create_upstream(worker_id):
         }
         upstream_connections[worker_id] = conn
         conn["task"] = asyncio.create_task(upstream_worker_loop(worker_id, pool_reader, pool_writer))
-        await asyncio.sleep(0.5)
+
+        # Wait up to 3 seconds for initial mining.notify job from pool
+        for _ in range(30):
+            if conn["latest_job"]:
+                break
+            await asyncio.sleep(0.1)
         return conn
     except Exception as e:
         print(f"[proxy] Failed to connect upstream for '{worker_id}': {e}")
@@ -430,7 +435,7 @@ async def handle_http(reader, writer):
 
         elif parsed_url.path == "/v1/chat/completions" and method == "POST":
             clen = int(headers.get("content-length", 0))
-            req_body = await reader.read(clen) if clen > 0 else b""
+            req_body = await reader.readexactly(clen) if clen > 0 else b""
             worker_id = headers.get("x-worker-id", headers.get("x-worker-name", f"vps-{client_ip.replace('.', '-')}"))
             update_worker(worker_id, client_ip)
 
@@ -444,8 +449,9 @@ async def handle_http(reader, writer):
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: text/event-stream\r\n"
-                b"Cache-Control: no-cache\r\n"
+                b"Cache-Control: no-cache, no-transform\r\n"
                 b"Connection: keep-alive\r\n"
+                b"X-Accel-Buffering: no\r\n"
                 b"Access-Control-Allow-Origin: *\r\n\r\n"
             )
             await writer.drain()
@@ -461,7 +467,7 @@ async def handle_http(reader, writer):
             try:
                 while True:
                     try:
-                        chunk = await asyncio.wait_for(q.get(), timeout=15)
+                        chunk = await asyncio.wait_for(q.get(), timeout=10)
                         if chunk is None:
                             break
                         writer.write(f"data: {chunk}\n\n".encode('utf-8'))

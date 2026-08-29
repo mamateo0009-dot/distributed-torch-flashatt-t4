@@ -326,6 +326,7 @@ void cp_gpu_init(int* devs, int ndev)
         GpuCtx* g = &g_gpus[i];
         g->dev = devs[i];
         CU_CHECK(cudaSetDevice(g->dev));
+        CU_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
         if(g_cutlass_fused && !cp_cutlass_device_ok(g->dev)){
             fprintf(stderr,
                     "[gpu] GPU%d: --cutlass-fused needs Pascal SIMT (compute capability <= 7.5)\n",
