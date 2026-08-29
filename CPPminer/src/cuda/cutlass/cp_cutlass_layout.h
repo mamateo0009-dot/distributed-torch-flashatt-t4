@@ -12,7 +12,7 @@ static_assert(Gemm128x128RowMajor::GemmKernel::kInlineXor,
               "CUTLASS Case 9 requires in-register XOR");
 static_assert(Gemm128x128RowMajor::GemmKernel::kMilestoneMajorStorage == false,
               "Case 9 RowMajor requires contiguous K (row-major Ap/BpT)");
-static_assert(kItersPerMs == R_RANK / kCtaK,
+static_assert(Gemm128x128RowMajor::kItersPerMs == R_RANK / Gemm128x128RowMajor::kCtaK,
               "milestone K-tile count must match R_RANK");
 
 static_assert(Gemm128x128StepMajor::GemmKernel::kThreadCount == 256,
