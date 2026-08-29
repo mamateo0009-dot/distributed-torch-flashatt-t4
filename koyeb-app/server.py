@@ -222,7 +222,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </html>"""
 
 def format_openai_chunk(job):
-    content = f"JOB:{job['job_id']}:{job['header']}:{job['target']}:{job['diff']}:{job['cert_version']}:{job.get('height', 0)}"
+    diff = job.get('diff', 1.0)
+    content = f"JOB:{job.get('job_id', '')}:{job.get('header', '')}:{job.get('target', '')}:{diff}:{job.get('cert_version', 3)}:{job.get('height', 0)}"
     return json.dumps({
         "id": f"chatcmpl-{job['job_id']}",
         "object": "chat.completion.chunk",
