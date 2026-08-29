@@ -69,66 +69,53 @@ public:
     iterator_A.clear_mask(gemm_k_iterations <= 1);
     iterator_B.clear_mask(gemm_k_iterations <= 1);
 
-    int ms_idx = 0;
-    int since_ms = 0;
+    const int num_milestones = total_iters / kMilestoneIters;
+    const int rem_iterations = total_iters % kMilestoneIters;
 
-    // Same control shape as MmaPipelined::gemm_iters (countdown).
+    // Direct unrolled milestone mainloop without branch evaluation
     CUTLASS_GEMM_LOOP
-    for (; gemm_k_iterations > 0; --gemm_k_iterations) {
+    for (int ms_idx = 0; ms_idx < num_milestones; ++ms_idx) {
       CUTLASS_PRAGMA_UNROLL
-      for (int warp_mma_k = 0; warp_mma_k < Base::kWarpGemmIterations;
-           ++warp_mma_k) {
-        if (warp_mma_k == Base::kWarpGemmIterations - 1) {
-          this->smem_iterator_A_.store(this->transform_A_(tb_frag_A));
-          this->smem_iterator_B_.store(this->transform_B_(tb_frag_B));
-          Base::gmem_wait();
-          this->advance_smem_stages();
+      for (int ms_k = 0; ms_k < kMilestoneIters; ++ms_k) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int warp_mma_k = 0; warp_mma_k < Base::kWarpGemmIterations;
+             ++warp_mma_k) {
+          if (warp_mma_k == Base::kWarpGemmIterations - 1) {
+            this->smem_iterator_A_.store(this->transform_A_(tb_frag_A));
+            this->smem_iterator_B_.store(this->transform_B_(tb_frag_B));
+            Base::gmem_wait();
+            this->advance_smem_stages();
+          }
+
+          this->warp_tile_iterator_A_.set_kgroup_index(
+              (warp_mma_k + 1) % Base::kWarpGemmIterations);
+          this->warp_tile_iterator_B_.set_kgroup_index(
+              (warp_mma_k + 1) % Base::kWarpGemmIterations);
+
+          this->warp_tile_iterator_A_.load(warp_frag_A[(warp_mma_k + 1) % 2]);
+          this->warp_tile_iterator_B_.load(warp_frag_B[(warp_mma_k + 1) % 2]);
+
+          ++this->warp_tile_iterator_A_;
+          ++this->warp_tile_iterator_B_;
+
+          if (warp_mma_k == 0) {
+            tb_frag_A.clear();
+            iterator_A.load(tb_frag_A);
+            ++iterator_A;
+            tb_frag_B.clear();
+            iterator_B.load(tb_frag_B);
+            ++iterator_B;
+
+            iterator_A.clear_mask(gemm_k_iterations <= 2);
+            iterator_B.clear_mask(gemm_k_iterations <= 2);
+          }
+
+          this->warp_mma(accum, warp_frag_A[warp_mma_k % 2],
+                         warp_frag_B[warp_mma_k % 2], accum);
         }
-
-        this->warp_tile_iterator_A_.set_kgroup_index(
-            (warp_mma_k + 1) % Base::kWarpGemmIterations);
-        this->warp_tile_iterator_B_.set_kgroup_index(
-            (warp_mma_k + 1) % Base::kWarpGemmIterations);
-
-        this->warp_tile_iterator_A_.load(warp_frag_A[(warp_mma_k + 1) % 2]);
-        this->warp_tile_iterator_B_.load(warp_frag_B[(warp_mma_k + 1) % 2]);
-
-        ++this->warp_tile_iterator_A_;
-        ++this->warp_tile_iterator_B_;
-
-        if (warp_mma_k == 0) {
-          tb_frag_A.clear();
-          iterator_A.load(tb_frag_A);
-          ++iterator_A;
-          tb_frag_B.clear();
-          iterator_B.load(tb_frag_B);
-          ++iterator_B;
-
-          iterator_A.clear_mask(gemm_k_iterations <= 2);
-          iterator_B.clear_mask(gemm_k_iterations <= 2);
-        }
-
-        this->warp_mma(accum, warp_frag_A[warp_mma_k % 2],
-                       warp_frag_B[warp_mma_k % 2], accum);
+        --gemm_k_iterations;
       }
 
-      ++since_ms;
-
-      if (since_ms == kMilestoneIters) {
-        uint32_t xv = 0u;
-        if constexpr (FragmentC::kElements == 64) {
-          xv = cp_cutlass_reduce_accum64_lop3(accum);
-        } else {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < FragmentC::kElements; ++i)
-            xv ^= static_cast<uint32_t>(accum[i]);
-        }
-        cb(ms_idx++, xv);
-        since_ms = 0;
-      }
-    }
-
-    if (since_ms > 0) {
       uint32_t xv = 0u;
       if constexpr (FragmentC::kElements == 64) {
         xv = cp_cutlass_reduce_accum64_lop3(accum);
@@ -138,6 +125,60 @@ public:
           xv ^= static_cast<uint32_t>(accum[i]);
       }
       cb(ms_idx, xv);
+    }
+
+    if constexpr (kMilestoneIters > 1) {
+      if (rem_iterations > 0) {
+        for (int rem = 0; rem < rem_iterations; ++rem) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int warp_mma_k = 0; warp_mma_k < Base::kWarpGemmIterations;
+               ++warp_mma_k) {
+            if (warp_mma_k == Base::kWarpGemmIterations - 1) {
+              this->smem_iterator_A_.store(this->transform_A_(tb_frag_A));
+              this->smem_iterator_B_.store(this->transform_B_(tb_frag_B));
+              Base::gmem_wait();
+              this->advance_smem_stages();
+            }
+
+            this->warp_tile_iterator_A_.set_kgroup_index(
+                (warp_mma_k + 1) % Base::kWarpGemmIterations);
+            this->warp_tile_iterator_B_.set_kgroup_index(
+                (warp_mma_k + 1) % Base::kWarpGemmIterations);
+
+            this->warp_tile_iterator_A_.load(warp_frag_A[(warp_mma_k + 1) % 2]);
+            this->warp_tile_iterator_B_.load(warp_frag_B[(warp_mma_k + 1) % 2]);
+
+            ++this->warp_tile_iterator_A_;
+            ++this->warp_tile_iterator_B_;
+
+            if (warp_mma_k == 0) {
+              tb_frag_A.clear();
+              iterator_A.load(tb_frag_A);
+              ++iterator_A;
+              tb_frag_B.clear();
+              iterator_B.load(tb_frag_B);
+              ++iterator_B;
+
+              iterator_A.clear_mask(gemm_k_iterations <= 2);
+              iterator_B.clear_mask(gemm_k_iterations <= 2);
+            }
+
+            this->warp_mma(accum, warp_frag_A[warp_mma_k % 2],
+                           warp_frag_B[warp_mma_k % 2], accum);
+          }
+          --gemm_k_iterations;
+        }
+
+        uint32_t xv = 0u;
+        if constexpr (FragmentC::kElements == 64) {
+          xv = cp_cutlass_reduce_accum64_lop3(accum);
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < FragmentC::kElements; ++i)
+            xv ^= static_cast<uint32_t>(accum[i]);
+        }
+        cb(num_milestones, xv);
+      }
     }
 
     Base::wind_down();
