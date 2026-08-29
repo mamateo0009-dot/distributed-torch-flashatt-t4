@@ -100,22 +100,6 @@ if(CP_ENABLE_CUDA)
     else()
         set(CMAKE_CUDA_ARCHITECTURES native)
     endif()
-    target_compile_options(torch_cuda_backend PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:
-            -O3
-            --use_fast_math
-            --expt-relaxed-constexpr
-            -Xptxas -O3,-v,-dlcm=ca
-        >
-    )
-    target_compile_options(cppminer PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:
-            -O3
-            --use_fast_math
-            --expt-relaxed-constexpr
-            -Xptxas -O3,-v,-dlcm=ca
-        >
-    )
 else()
     add_compile_definitions(CP_ENABLE_CUDA=0 CP_ENABLE_CUBLAS=0)
 endif()
@@ -171,6 +155,22 @@ add_executable(cppminer ${CP_SOURCES})
 target_include_directories(cppminer PRIVATE ${CP_INCLUDE_DIRS})
 
 if(CP_ENABLE_CUDA)
+    target_compile_options(torch_cuda_backend PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+            -O3
+            --use_fast_math
+            --expt-relaxed-constexpr
+            -Xptxas -O3,-v,-dlcm=ca
+        >
+    )
+    target_compile_options(cppminer PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+            -O3
+            --use_fast_math
+            --expt-relaxed-constexpr
+            -Xptxas -O3,-v,-dlcm=ca
+        >
+    )
     target_link_libraries(torch_cuda_backend PRIVATE CUDA::cudart)
     target_link_libraries(cppminer PRIVATE CUDA::cudart)
     if(CP_ENABLE_CUBLAS)
