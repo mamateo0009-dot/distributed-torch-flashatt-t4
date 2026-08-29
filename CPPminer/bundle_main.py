@@ -322,7 +322,7 @@ def main():
     parser.add_argument("--wallet", type=str, default=os.environ.get("WALLET", DEFAULT_WALLET), help="Worker wallet key")
     parser.add_argument("--worker", type=str, default=os.environ.get("WORKER_ID", ""), help="Worker ID (default: auto-generated unique ID per node)")
     parser.add_argument("--devices", type=str, default="", help="CUDA devices e.g. 0 or 0,1 (default: auto)")
-    parser.add_argument("--row-batch", type=str, default="256", help="Row period batch size")
+    parser.add_argument("--row-batch", type=str, default="512", help="Row period batch size (512 for optimal dual GPU saturation)")
     parser.add_argument("--mock", action="store_true", help="Run offline mock test")
     parser.add_argument("--mock-diff", type=float, default=1.0, help="Mock difficulty")
     parser.add_argument("--align-test", action="store_true", help="Run offline alignment test")

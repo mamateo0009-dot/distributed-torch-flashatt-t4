@@ -27,17 +27,19 @@ static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128StepMajorTensorOp
 static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajorTensorOp>
     g_fused_row_major_tensorop[MAX_GPUS];
 
-static int g_configured_attributes = 0;
+static int g_configured_attributes[MAX_GPUS] = {0};
 
-static void cp_cutlass_configure_attributes()
+static void cp_cutlass_configure_attributes(int dev)
 {
-  if (g_configured_attributes) return;
+  const int dev_idx = (dev >= 0 && dev < MAX_GPUS) ? dev : 0;
+  if (g_configured_attributes[dev_idx]) return;
+  cudaSetDevice(dev);
   const void* simt_ptr = (const void*)cutlass::Kernel<typename cp_cutlass::Gemm128x128RowMajor::GemmKernel>;
   cudaFuncSetAttribute(simt_ptr, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
 
   const void* tensorop_ptr = (const void*)cutlass::Kernel<typename cp_cutlass::Gemm128x128RowMajorTensorOp::GemmKernel>;
   cudaFuncSetAttribute(tensorop_ptr, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-  g_configured_attributes = 1;
+  g_configured_attributes[dev_idx] = 1;
 }
 
 int cp_cutlass_device_ok(int dev)
@@ -105,7 +107,7 @@ int cp_cutlass_period_batch(
   }
 
   cutlass::Status st = cutlass::Status::kErrorInternal;
-  cp_cutlass_configure_attributes();
+  cp_cutlass_configure_attributes(dev);
 
   const bool use_tensorop = cp_cutlass_is_sm75(dev);
 
