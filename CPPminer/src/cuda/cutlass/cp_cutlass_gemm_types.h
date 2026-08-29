@@ -122,11 +122,11 @@ using Gemm128x128StepMajor = GemmTypesCase9<
     true, true, 1, 1>;
 
 /* Turing Sm75 TensorOp Specializations (INT8 MMA mma.sync.aligned.m8n8k32.s8.s8) */
-using Gemm128x128RowMajorTensorOp = GemmTypesCase9<
+using Gemm128x128RowMajorTensorOp = GemmTypesCase10<
     cutlass::arch::Sm75, cutlass::arch::OpClassTensorOp,
     cutlass::gemm::GemmShape<128, 128, 32>,
     cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<8, 8, 16>, 2,
-    true, false, 16, 16>;
+    16, 16>;
 
 using Gemm128x128StepMajorTensorOp = GemmTypesCase9<
     cutlass::arch::Sm75, cutlass::arch::OpClassTensorOp,
