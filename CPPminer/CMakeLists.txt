@@ -160,7 +160,7 @@ if(CP_ENABLE_CUDA)
             -O3
             --use_fast_math
             --expt-relaxed-constexpr
-            -Xptxas -O3,-v,-dlcm=ca
+            -Xptxas -O3,-v,-dlcm=ca,-maxrregcount=128
         >
     )
     target_compile_options(cppminer PRIVATE
@@ -168,7 +168,7 @@ if(CP_ENABLE_CUDA)
             -O3
             --use_fast_math
             --expt-relaxed-constexpr
-            -Xptxas -O3,-v,-dlcm=ca
+            -Xptxas -O3,-v,-dlcm=ca,-maxrregcount=128
         >
     )
     target_link_libraries(torch_cuda_backend PRIVATE CUDA::cudart)
