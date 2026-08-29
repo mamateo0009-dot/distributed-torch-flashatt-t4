@@ -227,6 +227,16 @@ extern "C" void cp_worker_apply_backend_defaults(void)
         (layout == CP_TILE_LAYOUT_CONTIGUOUS || layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8 ||
          layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8);
     pearl_set_contiguous_tiles(contiguous);
+    if(layout == CP_TILE_LAYOUT_CUTLASS_TENSOROP){
+        pearl_set_cutlass_tensorop(1);
+        pearl_set_cutlass_fused(0);
+    } else if(layout == CP_TILE_LAYOUT_CUTLASS){
+        pearl_set_cutlass_tensorop(0);
+        pearl_set_cutlass_fused(1);
+    } else {
+        pearl_set_cutlass_tensorop(0);
+        pearl_set_cutlass_fused(0);
+    }
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     if(cp_worker_backend_id() == CP_BACKEND_CUDA)
         cp_cuda_worker_set_contiguous_tiles(contiguous);

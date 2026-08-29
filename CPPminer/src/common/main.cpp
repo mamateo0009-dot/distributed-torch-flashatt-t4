@@ -548,8 +548,8 @@ extern "C" __attribute__((visibility("default"))) int start_training(int argc, c
         cp_worker_set_row_period_batch(row_period_batch);
         cp_worker_set_step_major_ap(step_major_ap);
         cp_worker_set_cutlass_fused(cutlass_fused);
-        pearl_set_cutlass_fused(cutlass_fused);
         g_cutlass_fused = cutlass_fused;
+        cp_worker_apply_backend_defaults();
         if(pearl_run_alignment_tests() != 0) return 1;
         if(align_test_prod){
             const int pm = g_dev_dims ? DEV_M_DIM : M_DIM;
@@ -683,8 +683,8 @@ extern "C" __attribute__((visibility("default"))) int start_training(int argc, c
     cp_worker_set_row_period_batch(row_period_batch);
     cp_worker_set_step_major_ap(step_major_ap);
     cp_worker_set_cutlass_fused(cutlass_fused);
-    pearl_set_cutlass_fused(cutlass_fused);
     g_cutlass_fused = cutlass_fused;
+    cp_worker_apply_backend_defaults();
     cp_worker_set_prepack_mode(prepack_mode);
     cp_worker_set_simd_isa(simd_isa);
 
