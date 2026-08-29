@@ -45,7 +45,7 @@ struct GemmTypesCommon {
   using EpilogueOpT = cutlass::epilogue::thread::LinearCombination<
       ElementOutput, kAlignmentC, ElementAccumulator, ElementCompute>;
   using ThreadblockSwizzle =
-      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>;
+      cutlass::gemm::threadblock::GemmHorizontalThreadblockSwizzle;
 
   using DefaultGemmKernel = typename cutlass::gemm::kernel::DefaultGemm<
       ElementInput, LayoutA, AlignmentA, ElementInput, LayoutB, AlignmentB, ElementOutput,
