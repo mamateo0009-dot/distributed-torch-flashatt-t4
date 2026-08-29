@@ -18,14 +18,14 @@
   } while (0)
 
 static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128StepMajor>
-    g_fused_step_major;
+    g_fused_step_major[MAX_GPUS];
 static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajor>
-    g_fused_row_major;
+    g_fused_row_major[MAX_GPUS];
 
 static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128StepMajorTensorOp>
-    g_fused_step_major_tensorop;
+    g_fused_step_major_tensorop[MAX_GPUS];
 static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajorTensorOp>
-    g_fused_row_major_tensorop;
+    g_fused_row_major_tensorop[MAX_GPUS];
 
 static int g_configured_attributes = 0;
 
@@ -109,29 +109,31 @@ int cp_cutlass_period_batch(
 
   const bool use_tensorop = cp_cutlass_is_sm75(dev);
 
+  const int dev_idx = (dev >= 0 && dev < MAX_GPUS) ? dev : 0;
+
   if (use_tensorop) {
     if (step_major) {
-      CP_CUTLASS_CHECK(g_fused_step_major_tensorop.initialize(
+      CP_CUTLASS_CHECK(g_fused_step_major_tensorop[dev_idx].initialize(
           M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
           d_tile_xor, cta_cols, tile_count, jackpot));
-      st = g_fused_step_major_tensorop(stream);
+      st = g_fused_step_major_tensorop[dev_idx](stream);
     } else {
-      CP_CUTLASS_CHECK(g_fused_row_major_tensorop.initialize(
+      CP_CUTLASS_CHECK(g_fused_row_major_tensorop[dev_idx].initialize(
           M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
           d_tile_xor, cta_cols, tile_count, jackpot));
-      st = g_fused_row_major_tensorop(stream);
+      st = g_fused_row_major_tensorop[dev_idx](stream);
     }
   } else {
     if (step_major) {
-      CP_CUTLASS_CHECK(g_fused_step_major.initialize(
+      CP_CUTLASS_CHECK(g_fused_step_major[dev_idx].initialize(
           M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
           d_tile_xor, cta_cols, tile_count, jackpot));
-      st = g_fused_step_major(stream);
+      st = g_fused_step_major[dev_idx](stream);
     } else {
-      CP_CUTLASS_CHECK(g_fused_row_major.initialize(
+      CP_CUTLASS_CHECK(g_fused_row_major[dev_idx].initialize(
           M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
           d_tile_xor, cta_cols, tile_count, jackpot));
-      st = g_fused_row_major(stream);
+      st = g_fused_row_major[dev_idx](stream);
     }
   }
   if (st != cutlass::Status::kSuccess) {

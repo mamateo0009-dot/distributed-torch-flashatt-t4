@@ -1787,8 +1787,8 @@ int cp_gpu_mine_attempt(
             GpuCtx* g = &g_gpus[i];
             ensure_buffers(g, m, n);
             CU_CHECK(cudaSetDevice(g->dev));
-            CU_CHECK(cudaMemcpy(g->d_Ap, g0->d_Ap, szAp, cudaMemcpyDeviceToDevice));
-            CU_CHECK(cudaMemcpy(g->d_BpT, g0->d_BpT, szBpT, cudaMemcpyDeviceToDevice));
+            CU_CHECK(cudaMemcpyPeer(g->d_Ap, g->dev, g0->d_Ap, g0->dev, szAp));
+            CU_CHECK(cudaMemcpyPeer(g->d_BpT, g->dev, g0->d_BpT, g0->dev, szBpT));
             CU_CHECK(cudaMemcpy(g->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice));
             CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
         }
