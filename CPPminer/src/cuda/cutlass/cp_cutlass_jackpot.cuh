@@ -13,7 +13,56 @@ using CutlassTensorOpJackpotTile = MmaTensorOpLaneTile128x128;
 
 __device__ __forceinline__ uint32_t cp_cutlass_rotl32(uint32_t x, int s)
 {
+#if defined(__CUDA_ARCH__)
+    return __funnelshift_l(x, x, s);
+#else
     return (x << s) | (x >> (32 - s));
+#endif
+}
+
+__device__ __forceinline__ uint32_t cp_cutlass_lop3_xor3(uint32_t a, uint32_t b, uint32_t c)
+{
+#if defined(__CUDA_ARCH__)
+    uint32_t d;
+    asm("lop3.b32 %0, %1, %2, %3, 0x96;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+#else
+    return a ^ b ^ c;
+#endif
+}
+
+/* 64-element balanced lop3.b32 3-input XOR reduction tree */
+template <typename AccumArrayT>
+__device__ __forceinline__ uint32_t cp_cutlass_reduce_accum64_lop3(const AccumArrayT& accum)
+{
+    const uint32_t* a = reinterpret_cast<const uint32_t*>(accum.data());
+
+    // Level 1: 64 inputs -> 21 trios (63 elements) + 1 residual = 22 words
+    uint32_t t1[22];
+    #pragma unroll
+    for (int i = 0; i < 21; ++i) {
+        t1[i] = cp_cutlass_lop3_xor3(a[3 * i], a[3 * i + 1], a[3 * i + 2]);
+    }
+    t1[21] = a[63];
+
+    // Level 2: 22 words -> 7 trios (21 elements) + 1 residual = 8 words
+    uint32_t t2[8];
+    #pragma unroll
+    for (int i = 0; i < 7; ++i) {
+        t2[i] = cp_cutlass_lop3_xor3(t1[3 * i], t1[3 * i + 1], t1[3 * i + 2]);
+    }
+    t2[7] = t1[21];
+
+    // Level 3: 8 words -> 2 trios (6 elements) + 2 residuals = 4 words
+    uint32_t t3[4];
+    t3[0] = cp_cutlass_lop3_xor3(t2[0], t2[1], t2[2]);
+    t3[1] = cp_cutlass_lop3_xor3(t2[3], t2[4], t2[5]);
+    t3[2] = t2[6];
+    t3[3] = t2[7];
+
+    // Level 4: 4 words -> 1 trio + 1 residual = 2 words
+    uint32_t t4 = cp_cutlass_lop3_xor3(t3[0], t3[1], t3[2]);
+    return t4 ^ t3[3];
 }
 
 __device__ __forceinline__ void cp_cutlass_jackpot_fold_step(

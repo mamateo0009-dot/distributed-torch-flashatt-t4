@@ -23,10 +23,6 @@ namespace cp_cutlass {
 
 constexpr int kCtaM = 128;
 constexpr int kCtaN = 128;
-constexpr int kCtaK = 32;
-
-static_assert(R_RANK % kCtaK == 0, "R_RANK must be a multiple of CTA K-tile");
-constexpr int kItersPerMs = R_RANK / kCtaK; /* 128/32 = 4 */
 
 using ElementInput = int8_t;
 using ElementOutput = int32_t;
@@ -40,6 +36,10 @@ template <typename ArchTag, typename OpClassTag, typename ThreadblockShape,
           typename WarpShape, typename InstructionShape, int Stages,
           int AlignmentA = 1, int AlignmentB = 1>
 struct GemmTypesCommon {
+  static constexpr int kCtaK = ThreadblockShape::kK;
+  static_assert(R_RANK % kCtaK == 0, "R_RANK must be a multiple of CTA K-tile");
+  static constexpr int kItersPerMs = R_RANK / kCtaK;
+
   static constexpr int kAlignmentC =
       cutlass::platform::is_same<OpClassTag, cutlass::arch::OpClassTensorOp>::value ? 4 : 1;
   using EpilogueOpT = cutlass::epilogue::thread::LinearCombination<
@@ -83,7 +83,7 @@ struct GemmTypesCase10
                                InstructionShape, Stages, AlignmentA, AlignmentB>;
   using MmaPipelined = typename Base::DefaultGemmKernel::Mma;
   using Mma =
-      cutlass::gemm::threadblock::MmaMilestone<MmaPipelined, kItersPerMs>;
+      cutlass::gemm::threadblock::MmaMilestone<MmaPipelined, Base::kItersPerMs>;
   using GemmKernel = cutlass::gemm::kernel::InlineXorKernel<
       Mma, typename Base::Epilogue, typename Base::EpilogueVisitor,
       typename Base::ThreadblockSwizzle,
@@ -121,17 +121,17 @@ using Gemm128x128StepMajor = GemmTypesCase9<
     cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<1, 1, 4>, 2,
     true, true, 1, 1>;
 
-/* Turing Sm75 TensorOp Specializations (INT8 MMA mma.sync.aligned.m8n8k32.s8.s8) */
+/* Turing Sm75 TensorOp Specializations (INT8 MMA mma.sync.aligned.m8n8k16.s8.s8, GemmShape<128, 128, 64>) */
 using Gemm128x128RowMajorTensorOp = GemmTypesCase10<
     cutlass::arch::Sm75, cutlass::arch::OpClassTensorOp,
-    cutlass::gemm::GemmShape<128, 128, 32>,
-    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<8, 8, 16>, 2,
+    cutlass::gemm::GemmShape<128, 128, 64>,
+    cutlass::gemm::GemmShape<32, 64, 64>, cutlass::gemm::GemmShape<8, 8, 16>, 2,
     16, 16>;
 
 using Gemm128x128StepMajorTensorOp = GemmTypesCase9<
     cutlass::arch::Sm75, cutlass::arch::OpClassTensorOp,
-    cutlass::gemm::GemmShape<128, 128, 32>,
-    cutlass::gemm::GemmShape<32, 64, 32>, cutlass::gemm::GemmShape<8, 8, 16>, 2,
+    cutlass::gemm::GemmShape<128, 128, 64>,
+    cutlass::gemm::GemmShape<32, 64, 64>, cutlass::gemm::GemmShape<8, 8, 16>, 2,
     true, true, 16, 16>;
 
 template <typename GemmTypesT>

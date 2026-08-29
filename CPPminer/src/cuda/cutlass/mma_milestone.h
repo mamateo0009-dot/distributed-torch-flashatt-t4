@@ -116,9 +116,13 @@ public:
 
       if (since_ms == kMilestoneIters) {
         uint32_t xv = 0u;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < FragmentC::kElements; ++i)
-          xv ^= static_cast<uint32_t>(accum[i]);
+        if constexpr (FragmentC::kElements == 64) {
+          xv = cp_cutlass_reduce_accum64_lop3(accum);
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < FragmentC::kElements; ++i)
+            xv ^= static_cast<uint32_t>(accum[i]);
+        }
         cb(ms_idx++, xv);
         since_ms = 0;
       }
@@ -126,9 +130,13 @@ public:
 
     if (since_ms > 0) {
       uint32_t xv = 0u;
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < FragmentC::kElements; ++i)
-        xv ^= static_cast<uint32_t>(accum[i]);
+      if constexpr (FragmentC::kElements == 64) {
+        xv = cp_cutlass_reduce_accum64_lop3(accum);
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < FragmentC::kElements; ++i)
+          xv ^= static_cast<uint32_t>(accum[i]);
+      }
       cb(ms_idx, xv);
     }
 

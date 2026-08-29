@@ -208,7 +208,7 @@ public:
       return;
 
     int const thread_idx = threadIdx.x;
-    int const warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    int const warp_idx = threadIdx.x >> 5;
     int const lane_idx = threadIdx.x % 32;
 
     MatrixCoord const threadblock_offset(tbo.m() * Mma::Shape::kM,
