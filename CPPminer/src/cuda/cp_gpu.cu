@@ -1553,8 +1553,10 @@ static int gpu_scan_device_period(
                 CU_CHECK(cudaSetDevice(g->dev));
                 gpu_period_gemm_batch(
                     g, m, n, rpi, cpi0, row_batch, col_batch, bound, g->stream);
-                launch_jackpot_batch(
-                    g, row_batch, col_batch, rpi, cpi0, m, n, bound);
+                if(!g->use_cutlass_fused){
+                    launch_jackpot_batch(
+                        g, row_batch, col_batch, rpi, cpi0, m, n, bound);
+                }
             }
 
             for(int i = 0; i < g_ngpu; i++){
@@ -1774,23 +1776,56 @@ int cp_gpu_mine_attempt(
             gpu_upload_rowmajor_noisy(g, h_A_noisy, h_B_noisy, m, n);
         }
     } else {
-        if(gpu_prepare_noisy_matrices(g0, cp_gpu_fresh_rng_seed(), job_key, m, n,
-                                      a_key_local) != 0)
-            return -1;
-        scan_key = a_key_local;
-        uint32_t a_key32[8];
-        memcpy(a_key32, scan_key, 32);
-        CU_CHECK(cudaSetDevice(g0->dev));
-        CU_CHECK(cudaMemcpy(g0->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice));
-        CU_CHECK(cudaMemcpy(g0->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
-        for(int i = 1; i < g_ngpu; i++){
+        uint64_t rng_seed = cp_gpu_fresh_rng_seed();
+        const int tpb = 256;
+        int total_a = m * K_DIM;
+        int total_b = n * K_DIM;
+        size_t pad_a = (szAp + 1023) / 1024 * 1024;
+        size_t pad_b = (szBpT + 1023) / 1024 * 1024;
+        uint8_t hash_a[32], hash_b[32], b_seed[32];
+
+        // 1. Generate random A and B^T simultaneously on all GPUs (100% local, zero PCIe)
+        for(int i = 0; i < g_ngpu; i++){
             GpuCtx* g = &g_gpus[i];
             ensure_buffers(g, m, n);
             CU_CHECK(cudaSetDevice(g->dev));
-            CU_CHECK(cudaMemcpyPeer(g->d_Ap, g->dev, g0->d_Ap, g0->dev, szAp));
-            CU_CHECK(cudaMemcpyPeer(g->d_BpT, g->dev, g0->d_BpT, g0->dev, szBpT));
-            CU_CHECK(cudaMemcpy(g->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice));
-            CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
+            cp_gen_random_matrix_kernel<<<(total_a + tpb - 1) / tpb, tpb, 0, g->stream>>>(
+                rng_seed, 0, total_a, g->d_A_sig);
+            cp_gen_random_matrix_kernel<<<(total_b + tpb - 1) / tpb, tpb, 0, g->stream>>>(
+                rng_seed, 1, total_b, g->d_Bt_sig);
+        }
+
+        // 2. Compute matrix keyed hash on GPU0
+        CU_CHECK(cudaSetDevice(g0->dev));
+        CU_CHECK(cudaStreamSynchronize(g0->stream));
+        if(gpu_matrix_keyed_hash(g0, g0->d_A_sig, szAp, pad_a, job_key, hash_a) != 0)
+            return -1;
+        if(gpu_matrix_keyed_hash(g0, g0->d_Bt_sig, szBpT, pad_b, job_key, hash_b) != 0)
+            return -1;
+
+        // 3. Derive noise seeds
+        pearl_derive_noise_seeds(job_key, hash_a, hash_b, (uint32_t)m, (uint32_t)n, g_salted,
+                                 b_seed, a_key_local);
+        scan_key = a_key_local;
+        uint32_t a_key32[8];
+        memcpy(a_key32, scan_key, 32);
+
+        // 4. Broadcast 32-byte seeds and apply noise in parallel on all GPUs (zero 1GB PCIe copy!)
+        for(int i = 0; i < g_ngpu; i++){
+            GpuCtx* g = &g_gpus[i];
+            CU_CHECK(cudaSetDevice(g->dev));
+            CU_CHECK(cudaMemcpyAsync(g->d_seed_a, a_key_local, 32, cudaMemcpyHostToDevice, g->stream));
+            CU_CHECK(cudaMemcpyAsync(g->d_seed_b, b_seed, 32, cudaMemcpyHostToDevice, g->stream));
+            CU_CHECK(cudaMemcpyAsync(g->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice, g->stream));
+            CU_CHECK(cudaMemcpyAsync(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice, g->stream));
+
+            gpu_noise_generate(g, m, n);
+            gpu_noise_apply(g, m, n);
+        }
+
+        for(int i = 0; i < g_ngpu; i++){
+            CU_CHECK(cudaSetDevice(g_gpus[i].dev));
+            CU_CHECK(cudaStreamSynchronize(g_gpus[i].stream));
         }
     }
 
