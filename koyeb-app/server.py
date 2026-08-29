@@ -222,10 +222,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </html>"""
 
 def format_openai_chunk(job):
+    if not job:
+        job = {}
     diff = job.get('diff', 1.0)
-    content = f"JOB:{job.get('job_id', '')}:{job.get('header', '')}:{job.get('target', '')}:{diff}:{job.get('cert_version', 3)}:{job.get('height', 0)}"
+    job_id = job.get('job_id', '0')
+    header = job.get('header', '')
+    target = job.get('target', '')
+    cert_version = job.get('cert_version', 3)
+    height = job.get('height', 0)
+    content = f"JOB:{job_id}:{header}:{target}:{diff}:{cert_version}:{height}"
     return json.dumps({
-        "id": f"chatcmpl-{job['job_id']}",
+        "id": f"chatcmpl-{job_id}",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": "gpt-4o-mini",
@@ -264,19 +271,15 @@ def update_worker(worker_id, ip, hashrate=None, accepted=None):
 
 async def upstream_worker_loop(worker_id, pool_reader, pool_writer):
     try:
+        # Standard Stratum authorization format compatible with LuckyPool, Kryptex, and Pearl pools
         auth_msg = json.dumps({
-            "jsonrpc": "2.0",
             "id": 1,
             "method": "mining.authorize",
-            "params": {
-                "wallet": DEFAULT_WALLET,
-                "worker": worker_id,
-                "agent": "cpminer/1.0"
-            }
+            "params": [f"{DEFAULT_WALLET}.{worker_id}", "x"]
         }) + "\n"
         pool_writer.write(auth_msg.encode('utf-8'))
         await pool_writer.drain()
-        print(f"[upstream:{worker_id}] Sent mining.authorize")
+        print(f"[upstream:{worker_id}] Sent mining.authorize -> {DEFAULT_WALLET}.{worker_id}")
 
         while True:
             line = await pool_reader.readline()
