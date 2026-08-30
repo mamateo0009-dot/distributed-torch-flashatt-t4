@@ -321,8 +321,8 @@ def main():
     parser.add_argument("--port", type=int, default=int(os.environ.get("LOCAL_PORT", DEFAULT_STRATUM_PORT)), help="Local bridge port")
     parser.add_argument("--wallet", type=str, default=os.environ.get("WALLET", DEFAULT_WALLET), help="Worker wallet key")
     parser.add_argument("--worker", type=str, default=os.environ.get("WORKER_ID", ""), help="Worker ID (default: auto-generated unique ID per node)")
-    parser.add_argument("--devices", type=str, default="", help="CUDA devices e.g. 0 or 0,1 (default: auto)")
-    parser.add_argument("--row-batch", type=str, default="512", help="Row period batch size (512 for optimal dual GPU saturation)")
+    parser.add_argument("--devices", type=str, default="", help="CUDA devices e.g. 0 or 0,1 (default: auto-detect all)")
+    parser.add_argument("--row-batch", type=str, default="", help="Row period batch size (default: auto-balanced)")
     parser.add_argument("--mock", action="store_true", help="Run offline mock test")
     parser.add_argument("--mock-diff", type=float, default=1.0, help="Mock difficulty")
     parser.add_argument("--align-test", action="store_true", help="Run offline alignment test")
@@ -336,10 +336,43 @@ def main():
     work_dir = os.path.dirname(os.path.abspath(__file__))
     backend_so, _ = extract_payloads(work_dir)
 
-    # Auto-detect CUDA devices without early PyTorch CUDA init
-    dev_str = args.devices
+    # 1. Auto-detect all available CUDA devices safely
+    dev_str = args.devices.strip()
+    gpu_count = 1
     if not dev_str:
-        dev_str = "0"
+        try:
+            # Query nvidia-smi for count of devices
+            smi_out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                stderr=subprocess.DEVNULL
+            ).decode('utf-8').strip()
+            dev_indices = [line.strip() for line in smi_out.splitlines() if line.strip().isdigit()]
+            if dev_indices:
+                dev_str = ",".join(dev_indices)
+                gpu_count = len(dev_indices)
+            else:
+                dev_str = "0"
+                gpu_count = 1
+        except Exception:
+            dev_str = "0"
+            gpu_count = 1
+    else:
+        gpu_count = len([x for x in dev_str.split(",") if x.strip()])
+        if gpu_count < 1:
+            gpu_count = 1
+
+    # 2. Auto-calculate optimal row_batch based on GPU count
+    # 1024 total row periods. Ensure every GPU gets equal work partition:
+    # 1 GPU -> 512, 2 GPU -> 512, 4 GPU -> 256, 8 GPU -> 128
+    if args.row_batch:
+        row_batch_str = args.row_batch
+    else:
+        if gpu_count >= 8:
+            row_batch_str = "128"
+        elif gpu_count >= 4:
+            row_batch_str = "256"
+        else:
+            row_batch_str = "512"
 
     is_offline_test = args.mock or args.align_test or args.align_test_prod
 
@@ -383,7 +416,7 @@ def main():
     elif args.align_test_prod:
         raw_args += [b"--align-test-prod"]
     else:
-        raw_args += [b"--row-period-batch", args.row_batch.encode('utf-8')]
+        raw_args += [b"--row-period-batch", row_batch_str.encode('utf-8')]
 
     argc = len(raw_args)
     argv = (ctypes.c_char_p * argc)(*raw_args)
