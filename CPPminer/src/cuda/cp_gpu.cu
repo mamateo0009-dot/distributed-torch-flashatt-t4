@@ -1226,8 +1226,6 @@ static float profile_period_batch_cuda_ms(
     CU_CHECK(cudaEventElapsedTime(&ms, e0, e1));
     return ms;
 }
-    return ms;
-}
 
 typedef struct {
     cudaEvent_t batch_start;
