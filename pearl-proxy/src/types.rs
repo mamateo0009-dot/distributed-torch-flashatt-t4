@@ -5,9 +5,15 @@ pub struct MiningNotify {
     pub job_id: String,
     pub header: String,
     pub target: String,
+    #[serde(default = "default_diff")]
     pub diff: f64,
+    #[serde(default)]
     pub cert_version: u32,
     pub height: Option<u64>,
+}
+
+fn default_diff() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

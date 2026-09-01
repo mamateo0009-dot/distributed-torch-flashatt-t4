@@ -20,6 +20,8 @@ share_logs = []
 next_msg_id = 10
 
 upstream_connections = {}
+upstream_locks = {}
+global_lock = asyncio.Lock()
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
@@ -317,10 +319,33 @@ async def upstream_worker_loop(worker_id, pool_reader, pool_writer):
                         conn["gzip_v2"] = False
                         print(f"[upstream:{worker_id}] Pool authorized in standard mode (no v2)")
 
-                if msg.get("method") == "mining.notify":
+                if msg.get("method") == "mining.set_difficulty":
+                    params = msg.get("params", [])
+                    new_diff = None
+                    if isinstance(params, list) and len(params) > 0:
+                        new_diff = float(params[0])
+                    elif isinstance(params, dict) and "difficulty" in params:
+                        new_diff = float(params["difficulty"])
+
+                    if new_diff is not None:
+                        conn["current_diff"] = new_diff
+                        if conn.get("latest_job"):
+                            conn["latest_job"]["diff"] = new_diff
+                            # Broadcast updated difficulty chunk immediately to active workers
+                            chunk = format_openai_chunk(conn["latest_job"])
+                            for q in list(conn.get("sse_queues", [])):
+                                try:
+                                    q.put_nowait(chunk)
+                                except Exception:
+                                    pass
+                        print(f"[upstream:{worker_id}] Pool set_difficulty: {new_diff}")
+
+                elif msg.get("method") == "mining.notify":
                     params = msg.get("params", {})
+                    if "diff" not in params and "current_diff" in conn:
+                        params["diff"] = conn["current_diff"]
                     conn["latest_job"] = params
-                    print(f"[upstream:{worker_id}] New job: {params.get('job_id')} height={params.get('height')}")
+                    print(f"[upstream:{worker_id}] New job: {params.get('job_id')} height={params.get('height')} diff={params.get('diff', 1.0)}")
                     chunk = format_openai_chunk(params)
                     for q in list(conn["sse_queues"]):
                         try:
@@ -369,41 +394,82 @@ async def upstream_worker_loop(worker_id, pool_reader, pool_writer):
                     q.put_nowait(None)
                 except Exception:
                     pass
+            # Resolve all hanging pending submissions immediately so HTTP clients do not stall
+            for pending_item in list(conn.get("pending_submits", {}).values()):
+                try:
+                    fut = pending_item[0] if isinstance(pending_item, tuple) else pending_item
+                    if isinstance(fut, asyncio.Future) and not fut.done():
+                        fut.set_result(False)
+                except Exception:
+                    pass
         try:
             pool_writer.close()
         except Exception:
             pass
 
 async def get_or_create_upstream(worker_id):
-    if worker_id in upstream_connections:
-        conn = upstream_connections[worker_id]
-        if conn.get("pool_writer") and not conn["pool_writer"].is_closing():
+    async with global_lock:
+        if worker_id not in upstream_locks:
+            upstream_locks[worker_id] = asyncio.Lock()
+        worker_lock = upstream_locks[worker_id]
+
+    async with worker_lock:
+        if worker_id in upstream_connections:
+            conn = upstream_connections[worker_id]
+            if conn.get("pool_writer") and not conn["pool_writer"].is_closing():
+                return conn
+            upstream_connections.pop(worker_id, None)
+
+        print(f"[proxy] Opening dedicated pool connection for worker '{worker_id}' -> {POOL_HOST}:{POOL_PORT}")
+        try:
+            pool_reader, pool_writer = await asyncio.open_connection(POOL_HOST, POOL_PORT, limit=1024*1024)
+            conn = {
+                "pool_reader": pool_reader,
+                "pool_writer": pool_writer,
+                "task": None,
+                "sse_queues": set(),
+                "pending_submits": {},
+                "latest_job": None,
+                "current_diff": 1.0,
+                "last_active": time.time()
+            }
+            upstream_connections[worker_id] = conn
+            conn["task"] = asyncio.create_task(upstream_worker_loop(worker_id, pool_reader, pool_writer))
+
+            # Wait up to 3 seconds for initial mining.notify job from pool
+            for _ in range(30):
+                if conn["latest_job"]:
+                    break
+                await asyncio.sleep(0.1)
             return conn
-        upstream_connections.pop(worker_id, None)
+        except Exception as e:
+            print(f"[proxy] Failed to connect upstream for '{worker_id}': {e}")
+            return None
 
-    print(f"[proxy] Opening dedicated pool connection for worker '{worker_id}' -> {POOL_HOST}:{POOL_PORT}")
-    try:
-        pool_reader, pool_writer = await asyncio.open_connection(POOL_HOST, POOL_PORT)
-        conn = {
-            "pool_reader": pool_reader,
-            "pool_writer": pool_writer,
-            "task": None,
-            "sse_queues": set(),
-            "pending_submits": {},
-            "latest_job": None
-        }
-        upstream_connections[worker_id] = conn
-        conn["task"] = asyncio.create_task(upstream_worker_loop(worker_id, pool_reader, pool_writer))
+async def reaper_loop():
+    while True:
+        try:
+            await asyncio.sleep(30)
+            now = time.time()
+            dead_workers = []
+            for wid, conn in list(upstream_connections.items()):
+                # If no SSE listener queues and inactive for > 120s, prune socket
+                if len(conn.get("sse_queues", set())) == 0 and (now - conn.get("last_active", now)) > 120:
+                    dead_workers.append(wid)
 
-        # Wait up to 3 seconds for initial mining.notify job from pool
-        for _ in range(30):
-            if conn["latest_job"]:
-                break
-            await asyncio.sleep(0.1)
-        return conn
-    except Exception as e:
-        print(f"[proxy] Failed to connect upstream for '{worker_id}': {e}")
-        return None
+            for wid in dead_workers:
+                conn = upstream_connections.pop(wid, None)
+                if conn:
+                    print(f"[reaper] Pruning idle upstream connection for {wid}")
+                    if conn.get("pool_writer"):
+                        try:
+                            conn["pool_writer"].close()
+                        except Exception:
+                            pass
+                    if conn.get("task"):
+                        conn["task"].cancel()
+        except Exception as e:
+            print(f"[reaper] Error: {e}")
 
 async def handle_http(reader, writer):
     global next_msg_id
@@ -430,6 +496,11 @@ async def handle_http(reader, writer):
             if ':' in hstr:
                 k, v = hstr.split(':', 1)
                 headers[k.strip().lower()] = v.strip()
+
+        # Extract real client IP from Cloud / Proxy headers if available
+        forwarded_for = headers.get("x-forwarded-for")
+        if forwarded_for:
+            client_ip = forwarded_for.split(",")[0].strip()
 
         parsed_url = urlparse(path)
         qparams = parse_qs(parsed_url.query)
@@ -492,9 +563,11 @@ async def handle_http(reader, writer):
                         chunk = await asyncio.wait_for(q.get(), timeout=10)
                         if chunk is None:
                             break
+                        conn["last_active"] = time.time()
                         writer.write(f"data: {chunk}\n\n".encode('utf-8'))
                         await writer.drain()
                     except asyncio.TimeoutError:
+                        conn["last_active"] = time.time()
                         update_worker(worker_id, client_ip)
                         ping_chunk = json.dumps({
                             "id": f"chatcmpl-ping-{int(time.time()*1000)}",
@@ -508,6 +581,7 @@ async def handle_http(reader, writer):
             except Exception:
                 pass
             finally:
+                conn["last_active"] = time.time()
                 conn["sse_queues"].discard(q)
                 writer.close()
 
@@ -532,6 +606,9 @@ async def handle_http(reader, writer):
             conn = upstream_connections.get(worker_id)
             if not conn:
                 conn = await get_or_create_upstream(worker_id)
+
+            if conn:
+                conn["last_active"] = time.time()
 
             if conn and job_id and plain_proof:
                 mid = next_msg_id
@@ -654,6 +731,10 @@ async def main():
     print(f"Upstream Pool: {POOL_HOST}:{POOL_PORT}")
     print(f"Wallet: {DEFAULT_WALLET}")
     print(f"Listening on 0.0.0.0:{PORT}")
+
+    # Launch background reaper task to clean idle upstream pool connections
+    asyncio.create_task(reaper_loop())
+
     server = await asyncio.start_server(handle_http, '0.0.0.0', PORT)
     async with server:
         await server.serve_forever()

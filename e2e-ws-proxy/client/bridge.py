@@ -21,6 +21,7 @@ import struct
 import hashlib
 import hmac
 import secrets
+import base64
 import argparse
 import socket
 import ssl
@@ -92,7 +93,7 @@ async def connect_ws_proxy(proxy_url: str, wallet: str, worker: str):
     ssl_ctx = ssl.create_default_context() if is_ssl else None
     reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx)
 
-    ws_key = secrets.base64.b64encode(secrets.token_bytes(16)).decode('ascii')
+    ws_key = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
     req = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
@@ -176,12 +177,36 @@ async def handle_local_miner(local_reader, local_writer, proxy_url: str, wallet:
         except Exception:
             pass
 
+    async def ws_ping_loop():
+        """Periodically sends WS Ping frames to keep NAT/firewalls and intermediate proxies alive."""
+        nonlocal ws_writer
+        try:
+            while True:
+                await asyncio.sleep(25)
+                ping_frame = make_client_ws_frame(b"ping", opcode=0x09)
+                ws_writer.write(ping_frame)
+                await ws_writer.drain()
+        except Exception:
+            pass
+
+    t1 = asyncio.create_task(local_to_ws())
+    t2 = asyncio.create_task(ws_to_local())
+    t3 = asyncio.create_task(ws_ping_loop())
+
     try:
-        await asyncio.gather(local_to_ws(), ws_to_local())
+        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        for task in list(pending) + [t3]:
+            task.cancel()
     finally:
         print(f"[E2E-BRIDGE] Miner disconnected: {worker}", flush=True)
-        ws_writer.close()
-        local_writer.close()
+        try:
+            ws_writer.close()
+        except Exception:
+            pass
+        try:
+            local_writer.close()
+        except Exception:
+            pass
 
 async def main():
     parser = argparse.ArgumentParser(description="Pearl E2E WebSocket Stealth Miner Bridge")

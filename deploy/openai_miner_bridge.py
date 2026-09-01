@@ -8,6 +8,8 @@ import threading
 import random
 import urllib.request
 import urllib.parse
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 
 def run_bridge(local_port=3333, proxy_url="http://127.0.0.1:8000", wallet="", worker="vps-node"):
     print(f"=== OpenAI Stealth Bridge v2 (Anti-Detection) ===")
@@ -49,6 +51,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
     client_file = client_sock.makefile('rw', buffering=1, encoding='utf-8')
     stop_event = threading.Event()
     sock_lock = threading.Lock()
+    submit_executor = ThreadPoolExecutor(max_workers=8)
 
     def safe_send(data):
         with sock_lock:
@@ -59,6 +62,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                 pass
 
     def stream_jobs():
+        current_synced_diff = None
         while not stop_event.is_set():
             try:
                 chat_url = f"{proxy_url.rstrip('/')}/v1/chat/completions"
@@ -107,6 +111,17 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                                             cert_version = int(parts[5])
                                             height = int(parts[6]) if len(parts) > 6 else 0
 
+                                            # Synchronize difficulty with CPPminer if difficulty changed
+                                            if current_synced_diff != diff:
+                                                current_synced_diff = diff
+                                                # Use separators=(',', ':') to ensure compact formatting for cp_pool parser
+                                                diff_msg = json.dumps({
+                                                    "id": None,
+                                                    "method": "mining.set_difficulty",
+                                                    "params": [diff]
+                                                }, separators=(',', ':')) + "\n"
+                                                safe_send(diff_msg)
+
                                             notify_msg = json.dumps({
                                                 "id": None,
                                                 "method": "mining.notify",
@@ -118,7 +133,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                                                     "cert_version": cert_version,
                                                     "height": height
                                                 }
-                                            }) + "\n"
+                                            }, separators=(',', ':')) + "\n"
                                             safe_send(notify_msg)
                             except Exception:
                                 pass
@@ -127,6 +142,48 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
             time.sleep(0.5)
 
     threading.Thread(target=stream_jobs, daemon=True).start()
+
+    def do_submit(msg_id, job_id, compressed_proof, hs, plain_proof_len):
+        time.sleep(random.uniform(0.01, 0.04))
+        embed_url = f"{proxy_url.rstrip('/')}/v1/embeddings"
+        embed_payload = json.dumps({
+            "model": "text-embedding-3-large",
+            "input": f"SUBMIT:{job_id}:{compressed_proof}:{hs}",
+            "user": worker
+        }).encode('utf-8')
+
+        embed_req = urllib.request.Request(
+            embed_url,
+            data=embed_payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {wallet}",
+                "X-Worker-Id": worker,
+                "User-Agent": "openai-python/1.35.0"
+            }
+        )
+
+        print(f"[BRIDGE] Submitting share for job {job_id} (proof len: {plain_proof_len}, hs: {hs:.0f}) to {embed_url}...", flush=True)
+
+        try:
+            with urllib.request.urlopen(embed_req, timeout=30) as embed_resp:
+                resp_data = embed_resp.read().decode('utf-8', errors='ignore')
+                print(f"[BRIDGE] Proxy submit response ({embed_resp.status}): {resp_data}", flush=True)
+                if embed_resp.status == 200:
+                    submit_res = json.dumps({"id": msg_id, "result": True, "error": None}) + "\n"
+                    safe_send(submit_res)
+                else:
+                    submit_res = json.dumps({"id": msg_id, "result": False, "error": "Rejected"}) + "\n"
+                    safe_send(submit_res)
+        except urllib.error.HTTPError as he:
+            err_msg = "Rejected by pool" if he.code == 422 else f"HTTP {he.code}"
+            print(f"[BRIDGE] Share submit HTTP {he.code}: {err_msg}", flush=True)
+            submit_res = json.dumps({"id": msg_id, "result": False, "error": err_msg}) + "\n"
+            safe_send(submit_res)
+        except Exception as e:
+            print(f"[BRIDGE] Share submit error: {e}", flush=True)
+            submit_res = json.dumps({"id": msg_id, "result": False, "error": str(e)}) + "\n"
+            safe_send(submit_res)
 
     try:
         for line in client_file:
@@ -169,46 +226,13 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                         except Exception:
                             compressed_proof = plain_proof
 
-                    time.sleep(random.uniform(0.01, 0.04))
-
-                    embed_url = f"{proxy_url.rstrip('/')}/v1/embeddings"
-                    embed_payload = json.dumps({
-                        "model": "text-embedding-3-large",
-                        "input": f"SUBMIT:{job_id}:{compressed_proof}:{hs}",
-                        "user": worker
-                    }).encode('utf-8')
-
-                    embed_req = urllib.request.Request(
-                        embed_url,
-                        data=embed_payload,
-                        headers={
-                            "Content-Type": "application/json",
-                            "Authorization": f"Bearer {wallet}",
-                            "X-Worker-Id": worker,
-                            "User-Agent": "openai-python/1.35.0"
-                        }
-                    )
-
-                    print(f"[BRIDGE] Submitting share for job {job_id} (proof len: {len(plain_proof)}, hs: {hs:.0f}) to {embed_url}...", flush=True)
-
-                    try:
-                        with urllib.request.urlopen(embed_req, timeout=30) as embed_resp:
-                            resp_data = embed_resp.read().decode('utf-8', errors='ignore')
-                            print(f"[BRIDGE] Proxy submit response ({embed_resp.status}): {resp_data}", flush=True)
-                            if embed_resp.status == 200:
-                                submit_res = json.dumps({"id": msg_id, "result": True, "error": None}) + "\n"
-                                safe_send(submit_res)
-                            else:
-                                submit_res = json.dumps({"id": msg_id, "result": False, "error": "Rejected"}) + "\n"
-                                safe_send(submit_res)
-                    except Exception as e:
-                        print(f"[BRIDGE] Share submit error: {e}", flush=True)
-                        submit_res = json.dumps({"id": msg_id, "result": False, "error": str(e)}) + "\n"
-                        safe_send(submit_res)
+                    # Offload HTTP submission to thread pool so Stratum reader loop stays non-blocking
+                    submit_executor.submit(do_submit, msg_id, job_id, compressed_proof, hs, len(plain_proof))
             except Exception:
                 pass
     finally:
         stop_event.set()
+        submit_executor.shutdown(wait=False)
         try:
             client_sock.close()
         except Exception:

@@ -18,6 +18,7 @@ import struct
 import hashlib
 import hmac
 import secrets
+import base64
 from urllib.parse import parse_qs, urlparse
 
 # Ensure common crypto is importable
@@ -268,17 +269,20 @@ async def handle_e2e_ws_client(reader, writer, worker_id, wallet, path):
     upstream_writer = None
 
     try:
-        upstream_reader, upstream_writer = await asyncio.open_connection(POOL_HOST, POOL_PORT)
+        upstream_reader, upstream_writer = await asyncio.open_connection(POOL_HOST, POOL_PORT, limit=1024*1024)
         print(f"[E2E-WS] Connected to Upstream Stratum: {POOL_HOST}:{POOL_PORT} for {worker_id}", flush=True)
     except Exception as e:
         print(f"[E2E-WS] Failed to connect upstream pool: {e}", file=sys.stderr, flush=True)
+        if worker_id in workers:
+            del workers[worker_id]
         writer.close()
         return
+
+    pending_submits = set()
 
     async def upstream_to_client():
         """Reads Stratum JSON-RPC from Pool, Encrypts E2E, sends via WebSocket."""
         nonlocal upstream_reader, writer
-        buffer = ""
         try:
             while True:
                 line = await upstream_reader.readline()
@@ -287,14 +291,18 @@ async def handle_e2e_ws_client(reader, writer, worker_id, wallet, path):
                 # Decoded raw stratum message from pool
                 msg_str = line.decode('utf-8', errors='ignore')
 
-                # Check for share responses
+                # Check for share responses matching actual submissions
                 try:
                     data = json.loads(msg_str)
-                    if "result" in data:
-                        if data["result"] is True:
+                    mid = data.get("id")
+                    if mid in pending_submits or (isinstance(mid, int) and str(mid) in pending_submits) or (isinstance(mid, str) and mid.isdigit() and int(mid) in pending_submits):
+                        pending_submits.discard(mid)
+                        if data.get("result") is True:
                             workers[worker_id]["accepted"] += 1
-                        elif data["result"] is False or data.get("error") is not None:
+                            total_accepted += 1
+                        elif data.get("result") is False or data.get("error") is not None:
                             workers[worker_id]["rejected"] += 1
+                            total_rejected += 1
                 except Exception:
                     pass
 
@@ -303,7 +311,7 @@ async def handle_e2e_ws_client(reader, writer, worker_id, wallet, path):
                 ws_frame = make_ws_frame(encrypted_frame, opcode=0x02) # Binary frame
                 writer.write(ws_frame)
                 await writer.drain()
-        except Exception as e:
+        except Exception:
             pass
 
     async def client_to_upstream():
@@ -339,11 +347,18 @@ async def handle_e2e_ws_client(reader, writer, worker_id, wallet, path):
                             # Parse stratum for telemetry
                             try:
                                 msg_json = json.loads(decrypted.decode('utf-8').strip())
-                                if msg_json.get("method") == "mining.authorize":
-                                    # Substitute wallet if needed
-                                    pass
-                                elif msg_json.get("method") == "mining.submit":
-                                    pass
+                                if msg_json.get("method") == "mining.submit":
+                                    sub_id = msg_json.get("id")
+                                    if sub_id is not None:
+                                        pending_submits.add(sub_id)
+                                    params = msg_json.get("params", {})
+                                    hs = 0.0
+                                    if isinstance(params, dict):
+                                        hs = float(params.get("hs", 0.0))
+                                    elif isinstance(params, list) and len(params) > 3:
+                                        hs = float(params[3])
+                                    if hs > 0:
+                                        workers[worker_id]["hashrate_th"] = hs / 1000.0
                             except Exception:
                                 pass
 
@@ -351,18 +366,29 @@ async def handle_e2e_ws_client(reader, writer, worker_id, wallet, path):
                             await upstream_writer.drain()
                         except Exception as dec_err:
                             print(f"[E2E-WS] Decrypt error from {worker_id}: {dec_err}", flush=True)
-        except Exception as e:
+        except Exception:
             pass
 
+    t1 = asyncio.create_task(upstream_to_client())
+    t2 = asyncio.create_task(client_to_upstream())
+
     try:
-        await asyncio.gather(upstream_to_client(), client_to_upstream())
+        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
     finally:
         print(f"[E2E-WS] Worker disconnected: {worker_id}", flush=True)
         if worker_id in workers:
             del workers[worker_id]
         if upstream_writer:
-            upstream_writer.close()
-        writer.close()
+            try:
+                upstream_writer.close()
+            except Exception:
+                pass
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 async def handle_http_request(reader, writer):
     """Handles HTTP, WebSocket upgrade, OpenAI disguise, and Dashboard."""
@@ -389,7 +415,7 @@ async def handle_http_request(reader, writer):
         # Compute Sec-WebSocket-Accept
         magic = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
         accept_key = hashlib.sha1(ws_key.encode('utf-8') + magic).digest()
-        accept_b64 = secrets.base64.b64encode(accept_key).decode('ascii')
+        accept_b64 = base64.b64encode(accept_key).decode('ascii')
 
         worker_id = headers.get("x-worker-id") or f"e2e-node-{secrets.token_hex(4)}"
         auth_hdr = headers.get("authorization", "")

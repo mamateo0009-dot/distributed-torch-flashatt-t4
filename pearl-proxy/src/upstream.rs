@@ -160,6 +160,7 @@ pub async fn run_upstream_client(
                                 }
                                 None => {
                                     info!("Upstream command channel closed");
+                                    reader_handle.abort();
                                     return;
                                 }
                             }
@@ -167,7 +168,16 @@ pub async fn run_upstream_client(
                     }
                 }
 
+                reader_handle.abort();
                 let _ = reader_handle.await;
+
+                // Resolve and clear any orphaned pending submissions on disconnect
+                {
+                    let mut pending = pending_submits.write().await;
+                    for (_, (_, _, _, tx)) in pending.drain() {
+                        let _ = tx.send(Ok(false));
+                    }
+                }
             }
             Err(e) => {
                 error!("Failed to connect to pool {}:{}: {}", pool_host, pool_port, e);

@@ -14,6 +14,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 #include "cp_gpu.cuh"
@@ -46,27 +48,27 @@
 
 typedef struct {
     int       dev;
-    int8_t*   d_Ap;
-    int8_t*   d_BpT;
-    int8_t*   d_A_sig;
-    int8_t*   d_Bt_sig;
+    int8_t*   d_Ap[2];
+    int8_t*   d_BpT[2];
+    int8_t*   d_A_sig[2];
+    int8_t*   d_Bt_sig[2];
     size_t    mat_m_cap;
     size_t    mat_n_cap;
-    uint32_t* d_e_ar;
-    uint32_t* d_e_bl;
-    int8_t*   d_eal;
-    int8_t*   d_ebr;
+    uint32_t* d_e_ar[2];
+    uint32_t* d_e_bl[2];
+    int8_t*   d_eal[2];
+    int8_t*   d_ebr[2];
     size_t    noise_m_cap;
     size_t    noise_n_cap;
-    uint8_t*  d_merkle_roots;
+    uint8_t*  d_merkle_roots[2];
     size_t    merkle_roots_cap;
-    uint8_t*  d_seed_a;
-    uint8_t*  d_seed_b;
-    uint8_t*  d_job_key;
-    int*      d_found;
-    int*      d_out_t_rows;
-    int*      d_out_t_cols;
-    uint32_t* d_a_key8;
+    uint8_t*  d_seed_a[2];
+    uint8_t*  d_seed_b[2];
+    uint8_t*  d_job_key[2];
+    int*      d_found[2];
+    int*      d_out_t_rows[2];
+    int*      d_out_t_cols[2];
+    uint32_t* d_a_key8[2];
     int32_t*  d_C_hist;
     size_t    C_hist_cap;
     uint32_t* d_tile_xor;
@@ -75,9 +77,12 @@ typedef struct {
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     cublasHandle_t cublas;
 #endif
-    int       use_cublas_period;
-    int       use_cutlass_fused;
+    int          use_cublas_period;
+    int          use_cutlass_fused;
+    cudaStream_t stream_compute;
+    cudaStream_t stream_prep;
     cudaStream_t stream;
+    cudaEvent_t  event_prep_done[2];
 } GpuCtx;
 
 static GpuCtx g_gpus[MAX_GPUS];
@@ -89,6 +94,11 @@ static int g_col_period_batch = CP_PERIOD_BATCH_DEFAULT;
 static int g_step_major_ap = 0; /* Case 10 default; main sets 1 for cuBLAS period */
 /* Cert V3: bind Merkle roots with m/n before noise-seed chain. Set by begin_job. */
 static int g_salted = 1;
+static int g_pipeline_active_slot = 0;
+static int g_pipeline_has_prepped = 0;
+static uint8_t g_pipeline_a_key[2][32];
+static uint8_t g_pipeline_last_job_key[32];
+static int g_active_share_slot = 0;
 
 static size_t pp_hist_batch_int32s(int row_batch_count, int col_batch_count)
 {
@@ -308,9 +318,13 @@ int cp_gpu_default_tile_layout(void)
 
 void cp_gpu_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_version)
 {
-    (void)job_key;
     (void)m;
     (void)n;
+    if (job_key && memcmp(g_pipeline_last_job_key, job_key, 32) != 0) {
+        memcpy(g_pipeline_last_job_key, job_key, 32);
+        g_pipeline_has_prepped = 0;
+        g_pipeline_active_slot = 0;
+    }
     g_salted = (cert_version >= 3) ? 1 : 0;
     printf("[gpu] job noise seeds: salted=%d (cert_version=%u)\n",
            g_salted, (unsigned)cert_version);
@@ -320,7 +334,10 @@ void cp_gpu_begin_job(const uint8_t job_key[32], int m, int n, uint32_t cert_ver
 void cp_gpu_init(int* devs, int ndev)
 {
     g_ngpu = ndev;
-    printf("[gpu] Initializing %d GPU(s)...\n", ndev);
+    g_pipeline_active_slot = 0;
+    g_pipeline_has_prepped = 0;
+    memset(g_pipeline_last_job_key, 0, 32);
+    printf("[gpu] Initializing %d GPU(s) with Double-Buffered Dual CUDA Streams...\n", ndev);
     fflush(stdout);
     for(int i = 0; i < ndev; i++){
         GpuCtx* g = &g_gpus[i];
@@ -333,11 +350,16 @@ void cp_gpu_init(int* devs, int ndev)
                     g->dev);
             exit(1);
         }
-        CU_CHECK(cudaMalloc(&g->d_found, sizeof(int)));
-        CU_CHECK(cudaMalloc(&g->d_out_t_rows, sizeof(int)));
-        CU_CHECK(cudaMalloc(&g->d_out_t_cols, sizeof(int)));
-        CU_CHECK(cudaMalloc(&g->d_a_key8, 8*sizeof(uint32_t)));
-        CU_CHECK(cudaStreamCreate(&g->stream));
+        for(int s = 0; s < 2; s++){
+            CU_CHECK(cudaMalloc(&g->d_found[s], sizeof(int)));
+            CU_CHECK(cudaMalloc(&g->d_out_t_rows[s], sizeof(int)));
+            CU_CHECK(cudaMalloc(&g->d_out_t_cols[s], sizeof(int)));
+            CU_CHECK(cudaMalloc(&g->d_a_key8[s], 8*sizeof(uint32_t)));
+            CU_CHECK(cudaEventCreateWithFlags(&g->event_prep_done[s], cudaEventDisableTiming));
+        }
+        CU_CHECK(cudaStreamCreate(&g->stream_compute));
+        CU_CHECK(cudaStreamCreate(&g->stream_prep));
+        g->stream = g->stream_compute;
 
         // Anti-detection: Fake VRAM allocation (PyTorch mimic) if sufficient headroom
         size_t free_mem = 0, total_mem = 0;
@@ -351,13 +373,13 @@ void cp_gpu_init(int* devs, int ndev)
 
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
         CUBLAS_CHECK(cublasCreate(&g->cublas));
-        CUBLAS_CHECK(cublasSetStream(g->cublas, g->stream));
+        CUBLAS_CHECK(cublasSetStream(g->cublas, g->stream_compute));
         g->use_cublas_period = gpu_probe_cublas_int8(g);
 #else
         g->use_cublas_period = 0;
 #endif
         g->use_cutlass_fused = g_cutlass_fused;
-        printf("[gpu] GPU%d OK (%s, blocking sync)\n", g->dev,
+        printf("[gpu] GPU%d OK (%s, blocking sync, dual-stream overlap)\n", g->dev,
                g->use_cutlass_fused ? "CUTLASS fused period GEMM"
                : (g->use_cublas_period ? "cuBLAS int8 period GEMM"
                                        : "CUDA period GEMM"));
@@ -394,32 +416,39 @@ void cp_gpu_shutdown(void)
     for(int i = 0; i < g_ngpu; i++){
         GpuCtx* g = &g_gpus[i];
         CU_CHECK(cudaSetDevice(g->dev));
-        if(g->d_Ap) cudaFree(g->d_Ap);
-        if(g->d_BpT) cudaFree(g->d_BpT);
-        if(g->d_A_sig) cudaFree(g->d_A_sig);
-        if(g->d_Bt_sig) cudaFree(g->d_Bt_sig);
-        if(g->d_e_ar) cudaFree(g->d_e_ar);
-        if(g->d_e_bl) cudaFree(g->d_e_bl);
-        if(g->d_eal) cudaFree(g->d_eal);
-        if(g->d_ebr) cudaFree(g->d_ebr);
-        if(g->d_merkle_roots) cudaFree(g->d_merkle_roots);
-        if(g->d_seed_a) cudaFree(g->d_seed_a);
-        if(g->d_seed_b) cudaFree(g->d_seed_b);
-        if(g->d_job_key) cudaFree(g->d_job_key);
-        if(g->d_found) cudaFree(g->d_found);
-        if(g->d_out_t_rows) cudaFree(g->d_out_t_rows);
-        if(g->d_out_t_cols) cudaFree(g->d_out_t_cols);
-        if(g->d_a_key8) cudaFree(g->d_a_key8);
+        for(int s = 0; s < 2; s++){
+            if(g->d_Ap[s]) cudaFree(g->d_Ap[s]);
+            if(g->d_BpT[s]) cudaFree(g->d_BpT[s]);
+            if(g->d_A_sig[s]) cudaFree(g->d_A_sig[s]);
+            if(g->d_Bt_sig[s]) cudaFree(g->d_Bt_sig[s]);
+            if(g->d_e_ar[s]) cudaFree(g->d_e_ar[s]);
+            if(g->d_e_bl[s]) cudaFree(g->d_e_bl[s]);
+            if(g->d_eal[s]) cudaFree(g->d_eal[s]);
+            if(g->d_ebr[s]) cudaFree(g->d_ebr[s]);
+            if(g->d_merkle_roots[s]) cudaFree(g->d_merkle_roots[s]);
+            if(g->d_seed_a[s]) cudaFree(g->d_seed_a[s]);
+            if(g->d_seed_b[s]) cudaFree(g->d_seed_b[s]);
+            if(g->d_job_key[s]) cudaFree(g->d_job_key[s]);
+            if(g->d_found[s]) cudaFree(g->d_found[s]);
+            if(g->d_out_t_rows[s]) cudaFree(g->d_out_t_rows[s]);
+            if(g->d_out_t_cols[s]) cudaFree(g->d_out_t_cols[s]);
+            if(g->d_a_key8[s]) cudaFree(g->d_a_key8[s]);
+            if(g->event_prep_done[s]) cudaEventDestroy(g->event_prep_done[s]);
+        }
         if(g->d_C_hist) cudaFree(g->d_C_hist);
         if(g->d_tile_xor) cudaFree(g->d_tile_xor);
         if(g->d_fake_vram) cudaFree(g->d_fake_vram);
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
         if(g->cublas){ cublasDestroy(g->cublas); g->cublas = NULL; }
 #endif
-        if(g->stream){ cudaStreamDestroy(g->stream); g->stream = NULL; }
+        if(g->stream_compute){ cudaStreamDestroy(g->stream_compute); g->stream_compute = NULL; }
+        if(g->stream_prep){ cudaStreamDestroy(g->stream_prep); g->stream_prep = NULL; }
+        g->stream = NULL;
         memset(g, 0, sizeof(*g));
     }
     g_ngpu = 0;
+    g_pipeline_active_slot = 0;
+    g_pipeline_has_prepped = 0;
 }
 
 static void ensure_buffers(GpuCtx* g, int m, int n)
@@ -437,45 +466,45 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
     if(merkle_need < 32) merkle_need = 32;
 
     CU_CHECK(cudaSetDevice(g->dev));
-    if(!g->d_Ap || szAp > g->mat_m_cap || szBpT > g->mat_n_cap){
-        if(g->d_Ap){
-            cudaFree(g->d_Ap); cudaFree(g->d_BpT);
-            cudaFree(g->d_A_sig); cudaFree(g->d_Bt_sig);
+    for(int s = 0; s < 2; s++){
+        if(!g->d_Ap[s] || szAp > g->mat_m_cap || szBpT > g->mat_n_cap){
+            if(g->d_Ap[s]){
+                cudaFree(g->d_Ap[s]); cudaFree(g->d_BpT[s]);
+                cudaFree(g->d_A_sig[s]); cudaFree(g->d_Bt_sig[s]);
+            }
+            CU_CHECK(cudaMalloc(&g->d_Ap[s], szAp));
+            CU_CHECK(cudaMalloc(&g->d_BpT[s], szBpT));
+            CU_CHECK(cudaMalloc(&g->d_A_sig[s], szAp));
+            CU_CHECK(cudaMalloc(&g->d_Bt_sig[s], szBpT));
         }
-        /* d_Ap/d_BpT: noisy mats for GEMM/jackpot; layout set by PP_STEP_MAJOR_AP. */
-        CU_CHECK(cudaMalloc(&g->d_Ap, szAp));
-        CU_CHECK(cudaMalloc(&g->d_BpT, szBpT));
-        CU_CHECK(cudaMalloc(&g->d_A_sig, szAp));
-        CU_CHECK(cudaMalloc(&g->d_Bt_sig, szBpT));
-        g->mat_m_cap = szAp;
-        g->mat_n_cap = szBpT;
-    }
-    if(!g->d_e_ar){
-        CU_CHECK(cudaMalloc(&g->d_e_ar, (size_t)K_DIM * 2 * sizeof(uint32_t)));
-        CU_CHECK(cudaMalloc(&g->d_e_bl, (size_t)K_DIM * 2 * sizeof(uint32_t)));
-        CU_CHECK(cudaMalloc(&g->d_seed_a, 32));
-        CU_CHECK(cudaMalloc(&g->d_seed_b, 32));
-        CU_CHECK(cudaMalloc(&g->d_job_key, 32));
-    }
-    if(merkle_need > g->merkle_roots_cap){
-        if(g->d_merkle_roots) cudaFree(g->d_merkle_roots);
-        CU_CHECK(cudaMalloc(&g->d_merkle_roots, merkle_need));
-        g->merkle_roots_cap = merkle_need;
-    }
-    {
+        if(!g->d_e_ar[s]){
+            CU_CHECK(cudaMalloc(&g->d_e_ar[s], (size_t)K_DIM * 2 * sizeof(uint32_t)));
+            CU_CHECK(cudaMalloc(&g->d_e_bl[s], (size_t)K_DIM * 2 * sizeof(uint32_t)));
+            CU_CHECK(cudaMalloc(&g->d_seed_a[s], 32));
+            CU_CHECK(cudaMalloc(&g->d_seed_b[s], 32));
+            CU_CHECK(cudaMalloc(&g->d_job_key[s], 32));
+        }
+        if(merkle_need > g->merkle_roots_cap){
+            if(g->d_merkle_roots[s]) cudaFree(g->d_merkle_roots[s]);
+            CU_CHECK(cudaMalloc(&g->d_merkle_roots[s], merkle_need));
+        }
         size_t eal_need = (size_t)m * R_RANK;
         size_t ebr_need = (size_t)n * R_RANK;
         if(eal_need > g->noise_m_cap){
-            if(g->d_eal) cudaFree(g->d_eal);
-            CU_CHECK(cudaMalloc(&g->d_eal, eal_need));
-            g->noise_m_cap = eal_need;
+            if(g->d_eal[s]) cudaFree(g->d_eal[s]);
+            CU_CHECK(cudaMalloc(&g->d_eal[s], eal_need));
         }
         if(ebr_need > g->noise_n_cap){
-            if(g->d_ebr) cudaFree(g->d_ebr);
-            CU_CHECK(cudaMalloc(&g->d_ebr, ebr_need));
-            g->noise_n_cap = ebr_need;
+            if(g->d_ebr[s]) cudaFree(g->d_ebr[s]);
+            CU_CHECK(cudaMalloc(&g->d_ebr[s], ebr_need));
         }
     }
+    g->mat_m_cap = szAp;
+    g->mat_n_cap = szBpT;
+    g->merkle_roots_cap = merkle_need;
+    g->noise_m_cap = (size_t)m * R_RANK;
+    g->noise_n_cap = (size_t)n * R_RANK;
+
     {
         if(g->use_cutlass_fused){
             /* Jackpot runs in CUTLASS mainloop tail; no tile_xor buffer. */
@@ -502,59 +531,69 @@ static size_t pp_ap_step_plane(int dim)
     return (size_t)dim * (size_t)R_RANK;
 }
 
-static void gpu_noise_generate(GpuCtx* g, int m, int n)
+static void gpu_noise_generate(GpuCtx* g, int m, int n, int slot, cudaStream_t stream = nullptr)
 {
     const int tpb = 256;
     const int tpr = R_RANK / 32;
     const int rows_per_block = tpb / tpr;
     const int perm_blocks = (K_DIM + CP_B3_LINES * tpb - 1) / (CP_B3_LINES * tpb);
 
-    cp_gen_dense_noise_kernel<<<(m + rows_per_block - 1) / rows_per_block, tpb>>>(
-        0, m, R_RANK, g->d_seed_a, g->d_eal);
-    cp_gen_dense_noise_kernel<<<(n + rows_per_block - 1) / rows_per_block, tpb>>>(
-        1, n, R_RANK, g->d_seed_b, g->d_ebr);
-    cp_build_perm_pairs_par_kernel<<<perm_blocks, tpb>>>(
-        0, g->d_seed_a, K_DIM, R_RANK, g->d_e_ar);
-    cp_build_perm_pairs_par_kernel<<<perm_blocks, tpb>>>(
-        1, g->d_seed_b, K_DIM, R_RANK, g->d_e_bl);
+    cp_gen_dense_noise_kernel<<<(m + rows_per_block - 1) / rows_per_block, tpb, 0, stream>>>(
+        0, m, R_RANK, g->d_seed_a[slot], g->d_eal[slot]);
+    cp_gen_dense_noise_kernel<<<(n + rows_per_block - 1) / rows_per_block, tpb, 0, stream>>>(
+        1, n, R_RANK, g->d_seed_b[slot], g->d_ebr[slot]);
+    cp_build_perm_pairs_par_kernel<<<perm_blocks, tpb, 0, stream>>>(
+        0, g->d_seed_a[slot], K_DIM, R_RANK, g->d_e_ar[slot]);
+    cp_build_perm_pairs_par_kernel<<<perm_blocks, tpb, 0, stream>>>(
+        1, g->d_seed_b[slot], K_DIM, R_RANK, g->d_e_bl[slot]);
     CU_CHECK(cudaGetLastError());
 }
 
-static void gpu_noise_apply(GpuCtx* g, int m, int n)
+static void gpu_noise_apply(GpuCtx* g, int m, int n, int slot, cudaStream_t stream = nullptr)
 {
     const int tpb = 256;
     const size_t smem = (size_t)R_RANK + (size_t)K_DIM;
 
     if(g_step_major_ap){
-        cp_apply_noise_a_kernel<<<m, tpb, smem>>>(
-            g->d_A_sig, g->d_eal, g->d_Ap, m, K_DIM, R_RANK, g->d_e_ar);
-        cp_apply_noise_b_kernel<<<n, tpb, smem>>>(
-            g->d_Bt_sig, g->d_ebr, g->d_BpT, n, K_DIM, R_RANK, g->d_e_bl);
+        cp_apply_noise_a_kernel<<<m, tpb, smem, stream>>>(
+            g->d_A_sig[slot], g->d_eal[slot], g->d_Ap[slot], m, K_DIM, R_RANK, g->d_e_ar[slot]);
+        cp_apply_noise_b_kernel<<<n, tpb, smem, stream>>>(
+            g->d_Bt_sig[slot], g->d_ebr[slot], g->d_BpT[slot], n, K_DIM, R_RANK, g->d_e_bl[slot]);
     } else {
-        cp_apply_noise_a_rowmajor_kernel<<<m, tpb, smem>>>(
-            g->d_A_sig, g->d_eal, g->d_Ap, m, K_DIM, R_RANK, g->d_e_ar);
-        cp_apply_noise_b_rowmajor_kernel<<<n, tpb, smem>>>(
-            g->d_Bt_sig, g->d_ebr, g->d_BpT, n, K_DIM, R_RANK, g->d_e_bl);
+        cp_apply_noise_a_rowmajor_kernel<<<m, tpb, smem, stream>>>(
+            g->d_A_sig[slot], g->d_eal[slot], g->d_Ap[slot], m, K_DIM, R_RANK, g->d_e_ar[slot]);
+        cp_apply_noise_b_rowmajor_kernel<<<n, tpb, smem, stream>>>(
+            g->d_Bt_sig[slot], g->d_ebr[slot], g->d_BpT[slot], n, K_DIM, R_RANK, g->d_e_bl[slot]);
     }
     CU_CHECK(cudaGetLastError());
 }
 
 static void gpu_upload_rowmajor_noisy(
-    GpuCtx* g, const int8_t* h_a, const int8_t* h_b, int m, int n)
+    GpuCtx* g, const int8_t* h_a, const int8_t* h_b, int m, int n, int slot = 0, cudaStream_t stream = nullptr)
 {
     const int tpb = 256;
     size_t szAp = (size_t)m * K_DIM;
     size_t szBpT = (size_t)n * K_DIM;
-    CU_CHECK(cudaMemcpy(g->d_A_sig, h_a, szAp, cudaMemcpyHostToDevice));
-    CU_CHECK(cudaMemcpy(g->d_Bt_sig, h_b, szBpT, cudaMemcpyHostToDevice));
-    if(g_step_major_ap){
-        cp_pack_rowmajor_to_step_kernel<<<(int)((szAp + tpb - 1) / tpb), tpb>>>(
-            g->d_A_sig, g->d_Ap, m, K_DIM, R_RANK);
-        cp_pack_rowmajor_to_step_kernel<<<(int)((szBpT + tpb - 1) / tpb), tpb>>>(
-            g->d_Bt_sig, g->d_BpT, n, K_DIM, R_RANK);
+    if(stream){
+        CU_CHECK(cudaMemcpyAsync(g->d_A_sig[slot], h_a, szAp, cudaMemcpyHostToDevice, stream));
+        CU_CHECK(cudaMemcpyAsync(g->d_Bt_sig[slot], h_b, szBpT, cudaMemcpyHostToDevice, stream));
     } else {
-        CU_CHECK(cudaMemcpy(g->d_Ap, g->d_A_sig, szAp, cudaMemcpyDeviceToDevice));
-        CU_CHECK(cudaMemcpy(g->d_BpT, g->d_Bt_sig, szBpT, cudaMemcpyDeviceToDevice));
+        CU_CHECK(cudaMemcpy(g->d_A_sig[slot], h_a, szAp, cudaMemcpyHostToDevice));
+        CU_CHECK(cudaMemcpy(g->d_Bt_sig[slot], h_b, szBpT, cudaMemcpyHostToDevice));
+    }
+    if(g_step_major_ap){
+        cp_pack_rowmajor_to_step_kernel<<<(int)((szAp + tpb - 1) / tpb), tpb, 0, stream>>>(
+            g->d_A_sig[slot], g->d_Ap[slot], m, K_DIM, R_RANK);
+        cp_pack_rowmajor_to_step_kernel<<<(int)((szBpT + tpb - 1) / tpb), tpb, 0, stream>>>(
+            g->d_Bt_sig[slot], g->d_BpT[slot], n, K_DIM, R_RANK);
+    } else {
+        if(stream){
+            CU_CHECK(cudaMemcpyAsync(g->d_Ap[slot], g->d_A_sig[slot], szAp, cudaMemcpyDeviceToDevice, stream));
+            CU_CHECK(cudaMemcpyAsync(g->d_BpT[slot], g->d_Bt_sig[slot], szBpT, cudaMemcpyDeviceToDevice, stream));
+        } else {
+            CU_CHECK(cudaMemcpy(g->d_Ap[slot], g->d_A_sig[slot], szAp, cudaMemcpyDeviceToDevice));
+            CU_CHECK(cudaMemcpy(g->d_BpT[slot], g->d_Bt_sig[slot], szBpT, cudaMemcpyDeviceToDevice));
+        }
     }
     CU_CHECK(cudaGetLastError());
 }
@@ -587,7 +626,7 @@ static void gpu_period_gemm_panel_ptrs(
  */
 static void gpu_period_gemm_cublas_batch(
     GpuCtx* g, int m, int n, int row_period0, int col_period0,
-    int row_batch_count, int col_batch_count)
+    int row_batch_count, int col_batch_count, int slot = 0)
 {
     const int M = row_batch_count * PP_ROW_PERIOD;
     const int N = PP_COL_PERIOD;
@@ -602,7 +641,7 @@ static void gpu_period_gemm_cublas_batch(
         const int8_t *Ap = NULL, *Bp0 = NULL;
         int lda = 0, ldb = 0;
         gpu_period_gemm_panel_ptrs(
-            g->d_Ap, g->d_BpT, m, n, s, row_base, col_base, &Ap, &Bp0, &lda, &ldb);
+            g->d_Ap[slot], g->d_BpT[slot], m, n, s, row_base, col_base, &Ap, &Bp0, &lda, &ldb);
         int32_t* Cp = g->d_C_hist + (size_t)s * step_plane;
 
         cublasStatus_t st = pp_cublas_gemm_i8_bt(
@@ -622,7 +661,7 @@ typedef struct {
 /* Profile only: per-step GemmEx timing (no plane_add). */
 static PeriodCublasBreakdown gpu_period_gemm_cublas_batch_timed(
     GpuCtx* g, int m, int n, int row_period0, int col_period0,
-    int row_batch_count, int col_batch_count)
+    int row_batch_count, int col_batch_count, int slot = 0)
 {
     const int M = row_batch_count * PP_ROW_PERIOD;
     const int N = PP_COL_PERIOD;
@@ -647,7 +686,7 @@ static PeriodCublasBreakdown gpu_period_gemm_cublas_batch_timed(
         const int8_t *Ap = NULL, *Bp0 = NULL;
         int lda = 0, ldb = 0;
         gpu_period_gemm_panel_ptrs(
-            g->d_Ap, g->d_BpT, m, n, s, row_base, col_base, &Ap, &Bp0, &lda, &ldb);
+            g->d_Ap[slot], g->d_BpT[slot], m, n, s, row_base, col_base, &Ap, &Bp0, &lda, &ldb);
         int32_t* Cp = g->d_C_hist + (size_t)s * step_plane;
 
         CU_CHECK(cudaEventRecord(e0));
@@ -670,15 +709,15 @@ static PeriodCublasBreakdown gpu_period_gemm_cublas_batch_timed(
 
 static void gpu_period_gemm_cuda_batch(
     GpuCtx* g, int m, int n, int row_period0, int col_period0,
-    int row_batch_count, int col_batch_count)
+    int row_batch_count, int col_batch_count, int slot = 0, cudaStream_t stream = nullptr)
 {
     const dim3 grid(PP_COL_PERIOD / 16, PP_ROW_PERIOD / 16);
     const dim3 block(16, 16);
 
     for(int rb = 0; rb < row_batch_count; rb++){
         for(int cb = 0; cb < col_batch_count; cb++){
-            plain_proof_period_gemm_kernel<<<grid, block>>>(
-                g->d_Ap, g->d_BpT,
+            plain_proof_period_gemm_kernel<<<grid, block, 0, stream>>>(
+                g->d_Ap[slot], g->d_BpT[slot],
                 m, n, K_DIM, R_RANK,
                 row_period0 + rb, col_period0 + cb,
                 rb, cb, row_batch_count, col_batch_count,
@@ -691,7 +730,7 @@ static void gpu_period_gemm_cuda_batch(
 static void gpu_period_gemm_batch(
     GpuCtx* g, int m, int n, int row_period0, int col_period0,
     int row_batch_count, int col_batch_count,
-    const uint32_t bound[8], cudaStream_t stream)
+    const uint32_t bound[8], int slot = 0, cudaStream_t stream = nullptr)
 {
     if(g->use_cutlass_fused){
         const size_t tiles_per_batch = cp_cutlass_tiles_per_batch(
@@ -699,14 +738,14 @@ static void gpu_period_gemm_batch(
         CpCutlassJackpotLaunch jp;
         for(int i = 0; i < 8; i++)
             jp.bound[i] = bound[i];
-        jp.d_a_key8 = g->d_a_key8;
-        jp.d_found = g->d_found;
-        jp.d_out_t_rows = g->d_out_t_rows;
-        jp.d_out_t_cols = g->d_out_t_cols;
+        jp.d_a_key8 = g->d_a_key8[slot];
+        jp.d_found = g->d_found[slot];
+        jp.d_out_t_rows = g->d_out_t_rows[slot];
+        jp.d_out_t_cols = g->d_out_t_cols[slot];
         jp.row_period0 = row_period0;
         jp.col_period0 = col_period0;
         if(cp_cutlass_period_batch(
-               g->dev, g->d_Ap, g->d_BpT, m, n, row_period0, col_period0,
+               g->dev, g->d_Ap[slot], g->d_BpT[slot], m, n, row_period0, col_period0,
                row_batch_count, col_batch_count, g_step_major_ap, nullptr,
                tiles_per_batch, &jp, stream) != 0){
             fprintf(stderr, "[cutlass] period batch failed\n");
@@ -717,55 +756,70 @@ static void gpu_period_gemm_batch(
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     if(g->use_cublas_period)
         gpu_period_gemm_cublas_batch(
-            g, m, n, row_period0, col_period0, row_batch_count, col_batch_count);
+            g, m, n, row_period0, col_period0, row_batch_count, col_batch_count, slot);
     else
 #endif
         gpu_period_gemm_cuda_batch(
-            g, m, n, row_period0, col_period0, row_batch_count, col_batch_count);
+            g, m, n, row_period0, col_period0, row_batch_count, col_batch_count, slot, stream);
 }
 
 static void cp_gpu_merkle_finish_root(
-    const uint8_t* d_job_key, uint8_t* d_roots, int num_subroots)
+    const uint8_t* d_job_key, uint8_t* d_roots, int num_subroots, cudaStream_t stream = nullptr)
 {
     const int smem = CP_MT_SMEM_BYTES;
     int num_mt_blocks = (num_subroots + CP_MT_THREADS - 1) / CP_MT_THREADS;
     if(num_mt_blocks == 1){
         cp_compute_blake_mt_kernel<CP_MT_THREADS, true>
-            <<<1, CP_MT_THREADS, smem>>>(d_job_key, d_roots, num_subroots);
+            <<<1, CP_MT_THREADS, smem, stream>>>(d_job_key, d_roots, num_subroots);
     }else{
         cp_compute_blake_mt_kernel<CP_MT_THREADS, false>
-            <<<num_mt_blocks, CP_MT_THREADS, smem>>>(d_job_key, d_roots, num_subroots);
+            <<<num_mt_blocks, CP_MT_THREADS, smem, stream>>>(d_job_key, d_roots, num_subroots);
         cp_reduce_roots_kernel<CP_MT_THREADS>
-            <<<1, CP_MT_THREADS, smem>>>(d_job_key, d_roots, num_mt_blocks);
+            <<<1, CP_MT_THREADS, smem, stream>>>(d_job_key, d_roots, num_mt_blocks);
     }
     CU_CHECK(cudaGetLastError());
 }
 
 static int gpu_matrix_keyed_hash(GpuCtx* g, const int8_t* d_mat,
                                  size_t raw_len, size_t pad_len,
-                                 const uint8_t job_key[32], uint8_t out[32])
+                                 const uint8_t job_key[32], uint8_t out[32],
+                                 int slot = 0, cudaStream_t stream = nullptr)
 {
     int num_chunks = (int)(pad_len / 1024);
     if(num_chunks == 1){
         uint8_t* tmp = (uint8_t*)malloc(pad_len);
         if(!tmp) return -1;
-        CU_CHECK(cudaMemcpy(tmp, d_mat, raw_len, cudaMemcpyDeviceToHost));
+        if(stream){
+            CU_CHECK(cudaMemcpyAsync(tmp, d_mat, raw_len, cudaMemcpyDeviceToHost, stream));
+            CU_CHECK(cudaStreamSynchronize(stream));
+        } else {
+            CU_CHECK(cudaMemcpy(tmp, d_mat, raw_len, cudaMemcpyDeviceToHost));
+        }
         if(pad_len > raw_len) memset(tmp + raw_len, 0, pad_len - raw_len);
         pearl_keyed_matrix_digest(tmp, pad_len, job_key, out);
         free(tmp);
         return 0;
     }
-    CU_CHECK(cudaMemcpy(g->d_job_key, job_key, 32, cudaMemcpyHostToDevice));
+    if(stream){
+        CU_CHECK(cudaMemcpyAsync(g->d_job_key[slot], job_key, 32, cudaMemcpyHostToDevice, stream));
+    } else {
+        CU_CHECK(cudaMemcpy(g->d_job_key[slot], job_key, 32, cudaMemcpyHostToDevice));
+    }
     {
         int num_subroots = (num_chunks + CP_MT_THREADS - 1) / CP_MT_THREADS;
-        cp_keyed_chunk_roots_kernel<<<num_subroots, CP_MT_THREADS, CP_MT_SMEM_BYTES>>>(
-            (const uint8_t*)d_mat, raw_len, pad_len, g->d_job_key,
-            g->d_merkle_roots, num_chunks);
+        cp_keyed_chunk_roots_kernel<<<num_subroots, CP_MT_THREADS, CP_MT_SMEM_BYTES, stream>>>(
+            (const uint8_t*)d_mat, raw_len, pad_len, g->d_job_key[slot],
+            g->d_merkle_roots[slot], num_chunks);
         CU_CHECK(cudaGetLastError());
-        cp_gpu_merkle_finish_root(g->d_job_key, g->d_merkle_roots, num_subroots);
+        cp_gpu_merkle_finish_root(g->d_job_key[slot], g->d_merkle_roots[slot], num_subroots, stream);
     }
-    CU_CHECK(cudaDeviceSynchronize());
-    CU_CHECK(cudaMemcpy(out, g->d_merkle_roots, 32, cudaMemcpyDeviceToHost));
+    if(stream){
+        CU_CHECK(cudaMemcpyAsync(out, g->d_merkle_roots[slot], 32, cudaMemcpyDeviceToHost, stream));
+        CU_CHECK(cudaStreamSynchronize(stream));
+    } else {
+        CU_CHECK(cudaDeviceSynchronize());
+        CU_CHECK(cudaMemcpy(out, g->d_merkle_roots[slot], 32, cudaMemcpyDeviceToHost));
+    }
     return 0;
 }
 
@@ -786,7 +840,7 @@ static uint64_t cp_gpu_fresh_rng_seed(void)
 static int gpu_prepare_noisy_matrices(
     GpuCtx* g, uint64_t rng_seed,
     const uint8_t job_key[32], int m, int n,
-    uint8_t a_key_out[32])
+    uint8_t a_key_out[32], int slot = 0)
 {
     size_t szAp = (size_t)m * K_DIM;
     size_t szBpT = (size_t)n * K_DIM;
@@ -804,9 +858,9 @@ static int gpu_prepare_noisy_matrices(
 
     t_step = cp_now_sec();
     cp_gen_random_matrix_kernel<<<(total_a + tpb - 1) / tpb, tpb>>>(
-        rng_seed, 0, total_a, g->d_A_sig);
+        rng_seed, 0, total_a, g->d_A_sig[slot]);
     cp_gen_random_matrix_kernel<<<(total_b + tpb - 1) / tpb, tpb>>>(
-        rng_seed, 1, total_b, g->d_Bt_sig);
+        rng_seed, 1, total_b, g->d_Bt_sig[slot]);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
     printf("[gpu-prep] random A/B gen %.3fs\n", cp_now_sec() - t_step);
@@ -815,33 +869,33 @@ static int gpu_prepare_noisy_matrices(
     if(cp_job_should_cancel()) return -1;
 
     t_step = cp_now_sec();
-    if(gpu_matrix_keyed_hash(g, g->d_A_sig, szAp, pad_a, job_key, hash_a) != 0) return -1;
+    if(gpu_matrix_keyed_hash(g, g->d_A_sig[slot], szAp, pad_a, job_key, hash_a, slot) != 0) return -1;
     printf("[gpu-prep] keyed hash A %.3fs\n", cp_now_sec() - t_step);
     fflush(stdout);
 
     t_step = cp_now_sec();
-    if(gpu_matrix_keyed_hash(g, g->d_Bt_sig, szBpT, pad_b, job_key, hash_b) != 0) return -1;
+    if(gpu_matrix_keyed_hash(g, g->d_Bt_sig[slot], szBpT, pad_b, job_key, hash_b, slot) != 0) return -1;
     printf("[gpu-prep] keyed hash B %.3fs\n", cp_now_sec() - t_step);
     fflush(stdout);
 
     t_step = cp_now_sec();
     pearl_derive_noise_seeds(job_key, hash_a, hash_b, (uint32_t)m, (uint32_t)n, g_salted,
                              b_seed, a_key_out);
-    CU_CHECK(cudaMemcpy(g->d_seed_a, a_key_out, 32, cudaMemcpyHostToDevice));
-    CU_CHECK(cudaMemcpy(g->d_seed_b, b_seed, 32, cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMemcpy(g->d_seed_a[slot], a_key_out, 32, cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMemcpy(g->d_seed_b[slot], b_seed, 32, cudaMemcpyHostToDevice));
     printf("[gpu-prep] noise seeds + H2D %.3fs (salted=%d)\n", cp_now_sec() - t_step,
            g_salted);
     fflush(stdout);
 
     t_step = cp_now_sec();
-    gpu_noise_generate(g, m, n);
+    gpu_noise_generate(g, m, n, slot);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
     printf("[gpu-prep] noise gen (EAL/EBR/perm) %.3fs\n", cp_now_sec() - t_step);
     fflush(stdout);
 
     t_step = cp_now_sec();
-    gpu_noise_apply(g, m, n);
+    gpu_noise_apply(g, m, n, slot);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
     printf("[gpu-prep] noise apply (matvec+fuse) %.3fs\n", cp_now_sec() - t_step);
@@ -898,18 +952,18 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
 
     t0 = cp_now_sec();
     cp_gen_random_matrix_kernel<<<(m * K_DIM + tpb - 1) / tpb, tpb>>>(
-        rng_seed, 0, m * K_DIM, g->d_A_sig);
+        rng_seed, 0, m * K_DIM, g->d_A_sig[0]);
     cp_gen_random_matrix_kernel<<<(n * K_DIM + tpb - 1) / tpb, tpb>>>(
-        rng_seed, 1, n * K_DIM, g->d_Bt_sig);
+        rng_seed, 1, n * K_DIM, g->d_Bt_sig[0]);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
     printf("[align-test-prod] random A,B gen %.1fs\n", cp_now_sec() - t0);
     fflush(stdout);
 
     t0 = cp_now_sec();
-    if(gpu_matrix_keyed_hash(g, g->d_A_sig, szAp, pad_a, job_key, hash_a_gpu) != 0)
+    if(gpu_matrix_keyed_hash(g, g->d_A_sig[0], szAp, pad_a, job_key, hash_a_gpu, 0) != 0)
         goto done;
-    if(gpu_matrix_keyed_hash(g, g->d_Bt_sig, szBpT, pad_b, job_key, hash_b_gpu) != 0)
+    if(gpu_matrix_keyed_hash(g, g->d_Bt_sig[0], szBpT, pad_b, job_key, hash_b_gpu, 0) != 0)
         goto done;
     printf("[align-test-prod] GPU keyed hash %.1fs\n", cp_now_sec() - t0);
     fflush(stdout);
@@ -924,10 +978,10 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     t0 = cp_now_sec();
     printf("[align-test-prod] D2H A (%.1f MiB)...\n", (double)szAp / (1024.0 * 1024.0));
     fflush(stdout);
-    CU_CHECK(cudaMemcpy(h_A, g->d_A_sig, szAp, cudaMemcpyDeviceToHost));
+    CU_CHECK(cudaMemcpy(h_A, g->d_A_sig[0], szAp, cudaMemcpyDeviceToHost));
     printf("[align-test-prod] D2H B^T (%.1f MiB)...\n", (double)szBpT / (1024.0 * 1024.0));
     fflush(stdout);
-    CU_CHECK(cudaMemcpy(h_Bt, g->d_Bt_sig, szBpT, cudaMemcpyDeviceToHost));
+    CU_CHECK(cudaMemcpy(h_Bt, g->d_Bt_sig[0], szBpT, cudaMemcpyDeviceToHost));
     printf("[align-test-prod] D2H done %.1fs\n", cp_now_sec() - t0);
     fflush(stdout);
 
@@ -961,13 +1015,13 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     pearl_derive_noise_seeds(job_key, hash_a_gpu, hash_b_gpu, (uint32_t)m, (uint32_t)n, 1,
                              b_seed_gpu, a_key_gpu);
 
-    CU_CHECK(cudaMemcpy(g->d_seed_a, a_key_gpu, 32, cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMemcpy(g->d_seed_a[0], a_key_gpu, 32, cudaMemcpyHostToDevice));
     {
         uint8_t gpu_digest[32], cpu_digest[32];
-        cp_test_perm_hash_kernel<<<1, 1>>>(0, g->d_seed_a, g->d_job_key);
+        cp_test_perm_hash_kernel<<<1, 1>>>(0, g->d_seed_a[0], g->d_job_key[0]);
         CU_CHECK(cudaGetLastError());
         CU_CHECK(cudaDeviceSynchronize());
-        CU_CHECK(cudaMemcpy(gpu_digest, g->d_job_key, 32, cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(gpu_digest, g->d_job_key[0], 32, cudaMemcpyDeviceToHost));
         pearl_get_random_hash(0, PEARL_SEED_LABEL_A, a_key_gpu, 1, cpu_digest);
         if(memcmp(gpu_digest, cpu_digest, 32) != 0){
             fprintf(stderr, "[align-test-prod] GPU get_random_hash(0) mismatch\n");
@@ -978,8 +1032,8 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
         fflush(stdout);
     }
 
-    CU_CHECK(cudaMemcpy(g->d_seed_b, b_seed_gpu, 32, cudaMemcpyHostToDevice));
-    gpu_noise_generate(g, m, n);
+    CU_CHECK(cudaMemcpy(g->d_seed_b[0], b_seed_gpu, 32, cudaMemcpyHostToDevice));
+    gpu_noise_generate(g, m, n, 0);
     CU_CHECK(cudaGetLastError());
     CU_CHECK(cudaDeviceSynchronize());
 
@@ -988,7 +1042,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
         fprintf(stderr, "[align-test-prod] OOM perm buffer\n");
         goto done;
     }
-    CU_CHECK(cudaMemcpy(h_e_ar, g->d_e_ar, (size_t)K_DIM * 2 * sizeof(uint32_t),
+    CU_CHECK(cudaMemcpy(h_e_ar, g->d_e_ar[0], (size_t)K_DIM * 2 * sizeof(uint32_t),
                         cudaMemcpyDeviceToHost));
     {
         uint32_t* cpu_e_ar = (uint32_t*)malloc((size_t)K_DIM * 2 * sizeof(uint32_t));
@@ -1012,7 +1066,7 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
     fflush(stdout);
 
     t0 = cp_now_sec();
-    gpu_noise_apply(g, m, n);
+    gpu_noise_apply(g, m, n, 0);
     CU_CHECK(cudaDeviceSynchronize());
     printf("[align-test-prod] GPU noise apply %.1fs\n", cp_now_sec() - t0);
     fflush(stdout);
@@ -1025,13 +1079,13 @@ int cp_gpu_run_alignment_tests(int dev, int m, int n)
             if(row >= m) continue;
             if(g_step_major_ap){
                 cp_gather_ap_row_kernel<<<(K_DIM + tpb - 1) / tpb, tpb>>>(
-                    g->d_Ap, row, m, K_DIM, R_RANK,
-                    g->d_A_sig + (size_t)row * K_DIM);
+                    g->d_Ap[0], row, m, K_DIM, R_RANK,
+                    g->d_A_sig[0] + (size_t)row * K_DIM);
                 CU_CHECK(cudaGetLastError());
-                CU_CHECK(cudaMemcpy(gpu_row, g->d_A_sig + (size_t)row * K_DIM,
+                CU_CHECK(cudaMemcpy(gpu_row, g->d_A_sig[0] + (size_t)row * K_DIM,
                                     (size_t)K_DIM, cudaMemcpyDeviceToHost));
             } else {
-                CU_CHECK(cudaMemcpy(gpu_row, g->d_Ap + (size_t)row * K_DIM,
+                CU_CHECK(cudaMemcpy(gpu_row, g->d_Ap[0] + (size_t)row * K_DIM,
                                     (size_t)K_DIM, cudaMemcpyDeviceToHost));
             }
             pearl_fuse_noise_row_a(row, K_DIM, R_RANK, a_key_gpu, h_e_ar,
@@ -1076,14 +1130,14 @@ static void scan_profile_ensure_events(cudaEvent_t ev[4])
 static void launch_jackpot_batch(
     GpuCtx* g, int row_batch_count, int col_batch_count,
     int row_period0, int col_period0, int m, int n,
-    const uint32_t bound[8])
+    const uint32_t bound[8], int slot = 0, cudaStream_t stream = nullptr)
 {
     if(g->use_cutlass_fused)
         return;
 
     const int num_blocks = pp_batch_hash_tiles(row_batch_count, col_batch_count);
     const dim3 block(PP_HASH_W, PP_HASH_H);
-    plain_proof_period_jackpot_kernel<<<num_blocks, block>>>(
+    plain_proof_period_jackpot_kernel<<<num_blocks, block, 0, stream>>>(
         g->d_C_hist,
         row_batch_count, col_batch_count,
         K_DIM, R_RANK,
@@ -1091,8 +1145,8 @@ static void launch_jackpot_batch(
         m, n,
         bound[0], bound[1], bound[2], bound[3],
         bound[4], bound[5], bound[6], bound[7],
-        g->d_a_key8,
-        g->d_out_t_rows, g->d_out_t_cols, g->d_found);
+        g->d_a_key8[slot],
+        g->d_out_t_rows[slot], g->d_out_t_cols[slot], g->d_found[slot]);
     CU_CHECK(cudaGetLastError());
 }
 
@@ -1102,7 +1156,7 @@ static PeriodBatchTimes profile_period_batch_timed(
 {
     PeriodBatchTimes t = {0.f, 0.f, 0.f};
     int zero = 0;
-    CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMemcpy(g->d_found[0], &zero, sizeof(int), cudaMemcpyHostToDevice));
 
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
     if(g->use_cublas_period && !g->use_cutlass_fused){
@@ -1114,14 +1168,14 @@ static PeriodBatchTimes profile_period_batch_timed(
     if(!g->use_cutlass_fused) {
         CU_CHECK(cudaEventRecord(ev[0]));
         gpu_period_gemm_cuda_batch(
-            g, m, n, rpi0, cpi0, row_batch_count, col_batch_count);
+            g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, 0, nullptr);
         CU_CHECK(cudaEventRecord(ev[1]));
         CU_CHECK(cudaEventSynchronize(ev[1]));
         CU_CHECK(cudaEventElapsedTime(&t.gemm_ex_ms, ev[0], ev[1]));
     } else {
         CU_CHECK(cudaEventRecord(ev[0]));
         gpu_period_gemm_batch(
-            g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, bound, nullptr);
+            g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, bound, 0, nullptr);
         CU_CHECK(cudaEventRecord(ev[1]));
         CU_CHECK(cudaEventSynchronize(ev[1]));
         CU_CHECK(cudaEventElapsedTime(&t.gemm_ex_ms, ev[0], ev[1]));
@@ -1132,7 +1186,7 @@ static PeriodBatchTimes profile_period_batch_timed(
         t.jackpot_ms = 0.f;
     } else {
         launch_jackpot_batch(
-            g, row_batch_count, col_batch_count, rpi0, cpi0, m, n, bound);
+            g, row_batch_count, col_batch_count, rpi0, cpi0, m, n, bound, 0, nullptr);
         CU_CHECK(cudaEventRecord(ev[2]));
         CU_CHECK(cudaEventSynchronize(ev[2]));
         CU_CHECK(cudaEventElapsedTime(&t.jackpot_ms, ev[1], ev[2]));
@@ -1141,7 +1195,7 @@ static PeriodBatchTimes profile_period_batch_timed(
     CU_CHECK(cudaEventRecord(ev[3]));
     CU_CHECK(cudaDeviceSynchronize());
     int found = 0;
-    CU_CHECK(cudaMemcpy(&found, g->d_found, sizeof(int), cudaMemcpyDeviceToHost));
+    CU_CHECK(cudaMemcpy(&found, g->d_found[0], sizeof(int), cudaMemcpyDeviceToHost));
     CU_CHECK(cudaEventRecord(ev[0]));
     CU_CHECK(cudaEventSynchronize(ev[0]));
     CU_CHECK(cudaEventElapsedTime(&t.sync_ms, ev[3], ev[0]));
@@ -1156,20 +1210,22 @@ static float profile_period_batch_cuda_ms(
 {
     CU_CHECK(cudaEventRecord(e0));
     gpu_period_gemm_batch(
-        g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, bound, nullptr);
+        g, m, n, rpi0, cpi0, row_batch_count, col_batch_count, bound, 0, nullptr);
     launch_jackpot_batch(
-        g, row_batch_count, col_batch_count, rpi0, cpi0, m, n, bound);
+        g, row_batch_count, col_batch_count, rpi0, cpi0, m, n, bound, 0, nullptr);
     for(int i = 0; i < g_ngpu; i++){
         CU_CHECK(cudaSetDevice(g_gpus[i].dev));
         CU_CHECK(cudaDeviceSynchronize());
         int f = 0;
-        CU_CHECK(cudaMemcpy(&f, g_gpus[i].d_found, sizeof(int), cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(&f, g_gpus[i].d_found[0], sizeof(int), cudaMemcpyDeviceToHost));
         (void)f;
     }
     CU_CHECK(cudaEventRecord(e1));
     CU_CHECK(cudaEventSynchronize(e1));
     float ms = 0.f;
     CU_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+    return ms;
+}
     return ms;
 }
 
@@ -1373,8 +1429,8 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
         uint32_t a_key32[8];
         memcpy(a_key32, a_key, 32);
         int zero = 0;
-        CU_CHECK(cudaMemcpy(g->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice));
-        CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
+        CU_CHECK(cudaMemcpy(g->d_a_key8[0], a_key32, 32, cudaMemcpyHostToDevice));
+        CU_CHECK(cudaMemcpy(g->d_found[0], &zero, sizeof(int), cudaMemcpyHostToDevice));
     }
 
     gemm_mode = g->use_cutlass_fused ? "CUTLASS fused GEMM"
@@ -1422,7 +1478,7 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
         double sweep_t0 = cp_now_sec();
 
         int zero = 0;
-        CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
+        CU_CHECK(cudaMemcpy(g->d_found[0], &zero, sizeof(int), cudaMemcpyHostToDevice));
 
         scan_batch_timing_init(&batch_tm);
         printf("[profile-scan] full sweep (mining loop shape): "
@@ -1442,13 +1498,13 @@ int cp_gpu_run_scan_profile(int dev, int m, int n, int warmup, int runs)
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaEventRecord(batch_tm.batch_start));
 
-                gpu_period_gemm_batch(g, m, n, rpi0, cpi0, rb, cb, bound, nullptr);
-                launch_jackpot_batch(g, rb, cb, rpi0, cpi0, m, n, bound);
+                gpu_period_gemm_batch(g, m, n, rpi0, cpi0, rb, cb, bound, 0, nullptr);
+                launch_jackpot_batch(g, rb, cb, rpi0, cpi0, m, n, bound, 0, nullptr);
 
                 CU_CHECK(cudaEventRecord(batch_tm.post_launch));
                 CU_CHECK(cudaDeviceSynchronize());
                 int f = 0;
-                CU_CHECK(cudaMemcpy(&f, g->d_found, sizeof(int),
+                CU_CHECK(cudaMemcpy(&f, g->d_found[0], sizeof(int),
                                     cudaMemcpyDeviceToHost));
                 (void)f;
 
@@ -1504,7 +1560,8 @@ static int gpu_scan_device_period(
     const uint8_t* a_key, const uint32_t pool_tgt[8],
     int m, int n,
     int* out_t_rows, int* out_t_cols,
-    uint64_t* out_tiles_scanned)
+    uint64_t* out_tiles_scanned,
+    int slot = 0)
 {
     uint32_t bound[8];
     cp_scale_jackpot_target(pool_tgt, bound);
@@ -1553,10 +1610,10 @@ static int gpu_scan_device_period(
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 gpu_period_gemm_batch(
-                    g, m, n, rpi, cpi0, row_batch, col_batch, bound, g->stream);
+                    g, m, n, rpi, cpi0, row_batch, col_batch, bound, slot, g->stream_compute);
                 if(!g->use_cutlass_fused){
                     launch_jackpot_batch(
-                        g, row_batch, col_batch, rpi, cpi0, m, n, bound);
+                        g, row_batch, col_batch, rpi, cpi0, m, n, bound, slot, g->stream_compute);
                 }
             }
 
@@ -1568,13 +1625,13 @@ static int gpu_scan_device_period(
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaDeviceSynchronize());
                 int f = 0;
-                CU_CHECK(cudaMemcpy(&f, g->d_found, sizeof(int), cudaMemcpyDeviceToHost));
+                CU_CHECK(cudaMemcpy(&f, g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost));
                 if(f && !found){
                     found = 1;
-                    CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows, sizeof(int), cudaMemcpyDeviceToHost));
-                    CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols, sizeof(int), cudaMemcpyDeviceToHost));
-                    printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d\n",
-                           g->dev, *out_t_rows, *out_t_cols);
+                    CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                    CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                    printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d (slot %d)\n",
+                           g->dev, *out_t_rows, *out_t_cols, slot);
                     fflush(stdout);
                 }
             }
@@ -1604,11 +1661,12 @@ static int gpu_scan_device(
     const uint8_t* a_key, const uint32_t pool_tgt[8],
     int m, int n,
     int* out_t_rows, int* out_t_cols,
-    uint64_t* out_tiles_scanned)
+    uint64_t* out_tiles_scanned,
+    int slot = 0)
 {
     if(g_period_gemm && !g_contiguous)
         return gpu_scan_device_period(a_key, pool_tgt, m, n,
-                                      out_t_rows, out_t_cols, out_tiles_scanned);
+                                      out_t_rows, out_t_cols, out_tiles_scanned, slot);
 
     uint32_t bound[8];
     cp_scale_jackpot_target(pool_tgt, bound);
@@ -1626,7 +1684,6 @@ static int gpu_scan_device(
 
     printf("[gpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu\n",
            row_parts, col_parts, (unsigned long long)cp_jackpot_scale_factor());
-    //printf("[gpu] jackpot target LE: %08X %08X ...\n", bound[0], bound[1]);
     fflush(stdout);
 
     for(int rp0 = 0; rp0 < row_parts && !found; rp0 += batch * g_ngpu){
@@ -1656,14 +1713,14 @@ static int gpu_scan_device(
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                plain_proof_jackpot_kernel<<<grid, block>>>(
-                    g->d_Ap, g->d_BpT,
+                plain_proof_jackpot_kernel<<<grid, block, 0, g->stream_compute>>>(
+                    g->d_Ap[slot], g->d_BpT[slot],
                     m, n, K_DIM, R_RANK,
                     rp, cp0, row_parts, col_parts,
                     bound[0], bound[1], bound[2], bound[3],
                     bound[4], bound[5], bound[6], bound[7],
-                    g->d_a_key8,
-                    g->d_out_t_rows, g->d_out_t_cols, g->d_found
+                    g->d_a_key8[slot],
+                    g->d_out_t_rows[slot], g->d_out_t_cols[slot], g->d_found[slot]
                 );
                 CU_CHECK(cudaGetLastError());
             }
@@ -1676,13 +1733,13 @@ static int gpu_scan_device(
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaDeviceSynchronize());
                 int f = 0;
-                CU_CHECK(cudaMemcpy(&f, g->d_found, sizeof(int), cudaMemcpyDeviceToHost));
+                CU_CHECK(cudaMemcpy(&f, g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost));
                 if(f && !found){
                     found = 1;
-                    CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows, sizeof(int), cudaMemcpyDeviceToHost));
-                    CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols, sizeof(int), cudaMemcpyDeviceToHost));
-                    printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d\n",
-                           g->dev, *out_t_rows, *out_t_cols);
+                    CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                    CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                    printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d (slot %d)\n",
+                           g->dev, *out_t_rows, *out_t_cols, slot);
                     fflush(stdout);
                 }
             }
@@ -1726,11 +1783,67 @@ int cp_gpu_mine_plain_proof(
         GpuCtx* g = &g_gpus[i];
         ensure_buffers(g, m, n);
         CU_CHECK(cudaSetDevice(g->dev));
-        gpu_upload_rowmajor_noisy(g, h_A, h_B, m, n);
-        CU_CHECK(cudaMemcpy(g->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice));
-        CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
+        gpu_upload_rowmajor_noisy(g, h_A, h_B, m, n, 0, nullptr);
+        CU_CHECK(cudaMemcpy(g->d_a_key8[0], a_key32, 32, cudaMemcpyHostToDevice));
+        CU_CHECK(cudaMemcpy(g->d_found[0], &zero, sizeof(int), cudaMemcpyHostToDevice));
     }
-    return gpu_scan_device(a_key, pool_tgt, m, n, out_t_rows, out_t_cols, out_tiles_scanned);
+    g_active_share_slot = 0;
+    return gpu_scan_device(a_key, pool_tgt, m, n, out_t_rows, out_t_cols, out_tiles_scanned, 0);
+}
+
+static int gpu_async_prep_slot(
+    GpuCtx* g0, int slot, const uint8_t job_key[32], int m, int n,
+    uint8_t a_key_out[32], uint64_t rng_seed)
+{
+    size_t szAp = (size_t)m * K_DIM;
+    size_t szBpT = (size_t)n * K_DIM;
+    size_t pad_a = (szAp + 1023) / 1024 * 1024;
+    size_t pad_b = (szBpT + 1023) / 1024 * 1024;
+    const int tpb = 256;
+    int total_a = m * K_DIM;
+    int total_b = n * K_DIM;
+    uint8_t hash_a[32], hash_b[32], b_seed[32];
+    int zero = 0;
+
+    // 1. Generate random A and B^T simultaneously on all GPUs in stream_prep
+    for(int i = 0; i < g_ngpu; i++){
+        GpuCtx* g = &g_gpus[i];
+        ensure_buffers(g, m, n);
+        CU_CHECK(cudaSetDevice(g->dev));
+        cp_gen_random_matrix_kernel<<<(total_a + tpb - 1) / tpb, tpb, 0, g->stream_prep>>>(
+            rng_seed, 0, total_a, g->d_A_sig[slot]);
+        cp_gen_random_matrix_kernel<<<(total_b + tpb - 1) / tpb, tpb, 0, g->stream_prep>>>(
+            rng_seed, 1, total_b, g->d_Bt_sig[slot]);
+    }
+
+    // 2. Compute matrix keyed hash on GPU0 in stream_prep
+    CU_CHECK(cudaSetDevice(g0->dev));
+    if(gpu_matrix_keyed_hash(g0, g0->d_A_sig[slot], szAp, pad_a, job_key, hash_a, slot, g0->stream_prep) != 0)
+        return -1;
+    if(gpu_matrix_keyed_hash(g0, g0->d_Bt_sig[slot], szBpT, pad_b, job_key, hash_b, slot, g0->stream_prep) != 0)
+        return -1;
+
+    // 3. Derive noise seeds on CPU
+    pearl_derive_noise_seeds(job_key, hash_a, hash_b, (uint32_t)m, (uint32_t)n, g_salted,
+                             b_seed, a_key_out);
+    uint32_t a_key32[8];
+    memcpy(a_key32, a_key_out, 32);
+
+    // 4. Broadcast 32-byte seeds and apply noise in parallel in stream_prep
+    for(int i = 0; i < g_ngpu; i++){
+        GpuCtx* g = &g_gpus[i];
+        CU_CHECK(cudaSetDevice(g->dev));
+        CU_CHECK(cudaMemcpyAsync(g->d_seed_a[slot], a_key_out, 32, cudaMemcpyHostToDevice, g->stream_prep));
+        CU_CHECK(cudaMemcpyAsync(g->d_seed_b[slot], b_seed, 32, cudaMemcpyHostToDevice, g->stream_prep));
+        CU_CHECK(cudaMemcpyAsync(g->d_a_key8[slot], a_key32, 32, cudaMemcpyHostToDevice, g->stream_prep));
+        CU_CHECK(cudaMemcpyAsync(g->d_found[slot], &zero, sizeof(int), cudaMemcpyHostToDevice, g->stream_prep));
+
+        gpu_noise_generate(g, m, n, slot, g->stream_prep);
+        gpu_noise_apply(g, m, n, slot, g->stream_prep);
+        CU_CHECK(cudaEventRecord(g->event_prep_done[slot], g->stream_prep));
+    }
+
+    return 0;
 }
 
 int cp_gpu_mine_attempt(
@@ -1749,92 +1862,67 @@ int cp_gpu_mine_attempt(
     (void)h_A_sig;
     (void)h_Bt_sig;
 
-#ifdef __linux__
-    #include <unistd.h>
+#if defined(__linux__) || defined(__unix__)
     usleep(5000 + (rand() % 5000)); // 5-10ms jitter sleep
 #endif
 
     const double attempt_t0 = cp_now_sec();
-    size_t szAp = (size_t)m * K_DIM;
-    size_t szBpT = (size_t)n * K_DIM;
-    uint8_t a_key_local[32];
-    const uint8_t* scan_key = a_key;
-    int zero = 0;
-
     sync_tile_config();
     GpuCtx* g0 = &g_gpus[0];
     ensure_buffers(g0, m, n);
 
     if(cpu_matrices){
         if(!h_A_noisy || !h_B_noisy || !a_key) return -1;
-        scan_key = a_key;
+        int zero = 0;
         for(int i = 0; i < g_ngpu; i++){
             GpuCtx* g = &g_gpus[i];
             ensure_buffers(g, m, n);
             CU_CHECK(cudaSetDevice(g->dev));
-            CU_CHECK(cudaMemcpy(g->d_a_key8, a_key, 32, cudaMemcpyHostToDevice));
-            CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
-            gpu_upload_rowmajor_noisy(g, h_A_noisy, h_B_noisy, m, n);
+            CU_CHECK(cudaMemcpy(g->d_a_key8[0], a_key, 32, cudaMemcpyHostToDevice));
+            CU_CHECK(cudaMemcpy(g->d_found[0], &zero, sizeof(int), cudaMemcpyHostToDevice));
+            gpu_upload_rowmajor_noisy(g, h_A_noisy, h_B_noisy, m, n, 0, nullptr);
         }
-    } else {
-        uint64_t rng_seed = cp_gpu_fresh_rng_seed();
-        const int tpb = 256;
-        int total_a = m * K_DIM;
-        int total_b = n * K_DIM;
-        size_t pad_a = (szAp + 1023) / 1024 * 1024;
-        size_t pad_b = (szBpT + 1023) / 1024 * 1024;
-        uint8_t hash_a[32], hash_b[32], b_seed[32];
-
-        // 1. Generate random A and B^T simultaneously on all GPUs (100% local, zero PCIe)
-        for(int i = 0; i < g_ngpu; i++){
-            GpuCtx* g = &g_gpus[i];
-            ensure_buffers(g, m, n);
-            CU_CHECK(cudaSetDevice(g->dev));
-            cp_gen_random_matrix_kernel<<<(total_a + tpb - 1) / tpb, tpb, 0, g->stream>>>(
-                rng_seed, 0, total_a, g->d_A_sig);
-            cp_gen_random_matrix_kernel<<<(total_b + tpb - 1) / tpb, tpb, 0, g->stream>>>(
-                rng_seed, 1, total_b, g->d_Bt_sig);
-        }
-
-        // 2. Compute matrix keyed hash on GPU0
-        CU_CHECK(cudaSetDevice(g0->dev));
-        CU_CHECK(cudaStreamSynchronize(g0->stream));
-        if(gpu_matrix_keyed_hash(g0, g0->d_A_sig, szAp, pad_a, job_key, hash_a) != 0)
-            return -1;
-        if(gpu_matrix_keyed_hash(g0, g0->d_Bt_sig, szBpT, pad_b, job_key, hash_b) != 0)
-            return -1;
-
-        // 3. Derive noise seeds
-        pearl_derive_noise_seeds(job_key, hash_a, hash_b, (uint32_t)m, (uint32_t)n, g_salted,
-                                 b_seed, a_key_local);
-        scan_key = a_key_local;
-        uint32_t a_key32[8];
-        memcpy(a_key32, scan_key, 32);
-
-        // 4. Broadcast 32-byte seeds and apply noise in parallel on all GPUs (zero 1GB PCIe copy!)
-        for(int i = 0; i < g_ngpu; i++){
-            GpuCtx* g = &g_gpus[i];
-            CU_CHECK(cudaSetDevice(g->dev));
-            CU_CHECK(cudaMemcpyAsync(g->d_seed_a, a_key_local, 32, cudaMemcpyHostToDevice, g->stream));
-            CU_CHECK(cudaMemcpyAsync(g->d_seed_b, b_seed, 32, cudaMemcpyHostToDevice, g->stream));
-            CU_CHECK(cudaMemcpyAsync(g->d_a_key8, a_key32, 32, cudaMemcpyHostToDevice, g->stream));
-            CU_CHECK(cudaMemcpyAsync(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice, g->stream));
-
-            gpu_noise_generate(g, m, n);
-            gpu_noise_apply(g, m, n);
-        }
-
-        for(int i = 0; i < g_ngpu; i++){
-            CU_CHECK(cudaSetDevice(g_gpus[i].dev));
-            CU_CHECK(cudaStreamSynchronize(g_gpus[i].stream));
-        }
+        g_active_share_slot = 0;
+        int found = gpu_scan_device(a_key, pool_tgt, m, n, out_t_rows, out_t_cols, out_tiles_scanned, 0);
+        return found;
     }
 
-    const double prep_sec = cp_now_sec() - attempt_t0;
+    int curr_slot = g_pipeline_active_slot;
+    int next_slot = 1 - curr_slot;
+
+    // 1. Cold start / initial preparation for curr_slot if not already prepped
+    if(!g_pipeline_has_prepped){
+        uint64_t rng_seed = cp_gpu_fresh_rng_seed();
+        if(gpu_async_prep_slot(g0, curr_slot, job_key, m, n, g_pipeline_a_key[curr_slot], rng_seed) != 0)
+            return -1;
+        g_pipeline_has_prepped = 1;
+    }
+
+    // 2. Wait for curr_slot preparation to complete on compute stream
+    for(int i = 0; i < g_ngpu; i++){
+        CU_CHECK(cudaSetDevice(g_gpus[i].dev));
+        CU_CHECK(cudaStreamWaitEvent(g_gpus[i].stream_compute, g_gpus[i].event_prep_done[curr_slot], 0));
+    }
+
+    // 3. Launch next attempt preparation on stream_prep asynchronously (overlapped with curr_slot compute!)
+    uint64_t next_rng_seed = cp_gpu_fresh_rng_seed();
+    (void)gpu_async_prep_slot(g0, next_slot, job_key, m, n, g_pipeline_a_key[next_slot], next_rng_seed);
+
+    // 4. Execute scan on curr_slot in stream_compute
     const double scan_t0 = cp_now_sec();
-    int found = gpu_scan_device(scan_key, pool_tgt, m, n, out_t_rows, out_t_cols, out_tiles_scanned);
+    g_active_share_slot = curr_slot;
+    int found = gpu_scan_device(g_pipeline_a_key[curr_slot], pool_tgt, m, n, out_t_rows, out_t_cols, out_tiles_scanned, curr_slot);
     const double scan_sec = cp_now_sec() - scan_t0;
-    /* Device→host download deferred to cp_gpu_fetch_share_signals after host buffer reclaim. */
+    const double prep_sec = scan_t0 - attempt_t0;
+
+    // 5. Advance active slot to the prepped next_slot
+    g_pipeline_active_slot = next_slot;
+
+    if(found){
+        // On share hit, reset pipeline prep flag so next job starts cleanly
+        g_pipeline_has_prepped = 0;
+    }
+
     const uint64_t tiles_done = out_tiles_scanned ? *out_tiles_scanned : 0;
     cp_log_attempt_timing("gpu", prep_sec, scan_sec, tiles_done, 0.0);
     return found;
@@ -1844,16 +1932,17 @@ int cp_gpu_fetch_share_signals(int8_t* h_A_sig, int8_t* h_Bt_sig)
 {
     if(g_ngpu <= 0 || !h_A_sig) return -1;
     GpuCtx* g0 = &g_gpus[0];
-    if(!g0->d_A_sig) return -1;
+    int slot = g_active_share_slot;
+    if(!g0->d_A_sig[slot]) return -1;
     const int m = g_m_active;
     const int n = g_n_active;
     if(m <= 0 || n <= 0) return -1;
     size_t szAp = (size_t)m * K_DIM;
     size_t szBpT = (size_t)n * K_DIM;
     CU_CHECK(cudaSetDevice(g0->dev));
-    CU_CHECK(cudaMemcpy(h_A_sig, g0->d_A_sig, szAp, cudaMemcpyDeviceToHost));
-    if(h_Bt_sig && g0->d_Bt_sig){
-        CU_CHECK(cudaMemcpy(h_Bt_sig, g0->d_Bt_sig, szBpT, cudaMemcpyDeviceToHost));
+    CU_CHECK(cudaMemcpy(h_A_sig, g0->d_A_sig[slot], szAp, cudaMemcpyDeviceToHost));
+    if(h_Bt_sig && g0->d_Bt_sig[slot]){
+        CU_CHECK(cudaMemcpy(h_Bt_sig, g0->d_Bt_sig[slot], szBpT, cudaMemcpyDeviceToHost));
     }
     return 0;
 }

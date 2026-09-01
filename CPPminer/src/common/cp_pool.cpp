@@ -152,10 +152,14 @@ static void pool_dispatch_line(const char* line)
     if(strstr(line, "mining.set_difficulty")){
         double d = cp_json_num(line, "params");
         if(!d){
-            const char* p = strstr(line, "\"params\":[");
+            const char* p = strstr(line, "\"params\"");
             if(p){
                 p = strchr(p, '[');
-                if(p) d = atof(p + 1);
+                if(p){
+                    p++;
+                    while(*p == ' ' || *p == '\t') p++;
+                    d = atof(p);
+                }
             }
         }
         if(d > 0.0){
@@ -390,7 +394,7 @@ int cp_pool_parse_notify(const char* json,
         return header_hex[0] != 0;
     }
 
-    const char* p = strstr(json, "\"params\":[");
+    const char* p = strstr(json, "\"params\"");
     if(!p) return 0;
     p = strchr(p, '[');
     if(!p) return 0;
