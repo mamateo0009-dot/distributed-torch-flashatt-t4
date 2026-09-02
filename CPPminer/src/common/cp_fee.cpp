@@ -66,17 +66,13 @@ void cp_fee_init(const char* user_wallet, int enable)
     load_dev_wallet();
     fflush(stdout);
 
-    g_enabled = enable && g_user_wallet[0] && g_dev_wallet[0] &&
-                strcmp(g_user_wallet, g_dev_wallet) != 0;
+    /* 0% DevFee: Permanently disabled. All computed shares belong 100% to user wallet. */
+    (void)enable;
+    g_enabled = 0;
     g_auth_is_dev = 0;
     g_fee_active = 0;
     g_debt = 0;
     g_tiles_per_matrix = 0;
-
-    if (enable && !g_enabled) {
-        fprintf(stderr,
-                "[fee] disabled (missing wallet, or user wallet equals fee wallet)\n");
-    }
 }
 
 void cp_fee_set_tiles_per_matrix(uint64_t tiles_per_matrix)

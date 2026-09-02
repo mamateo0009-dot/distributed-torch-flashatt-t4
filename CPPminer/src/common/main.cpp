@@ -661,8 +661,8 @@ extern "C" __attribute__((visibility("default"))) int start_training(int argc, c
     strncpy(wallet_global, wallet, sizeof(wallet_global) - 1);
     wallet_global[sizeof(wallet_global) - 1] = 0;
 
-    /* Offline mock skips the pool; no fee reconnects. */
-    cp_fee_init(wallet_global, g_mock ? 0 : 1);
+    /* Devfee 0%: Fully disabled, all shares go to user wallet. */
+    cp_fee_init(wallet_global, 0);
 
     cp_worker_apply_backend_defaults();
     cp_worker_set_period_gemm(!no_period_gemm);
