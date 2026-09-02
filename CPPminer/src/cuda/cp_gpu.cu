@@ -46,6 +46,24 @@
 } while(0)
 #endif
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
+static void cp_gpu_set_l2_persistence(int dev, cudaStream_t stream, void* ptr, size_t num_bytes)
+{
+    cudaDeviceProp prop{};
+    if(cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.persistingL2CacheMaxSize > 0){
+        cudaStreamAttrValue attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.accessPolicyWindow.base_ptr = ptr;
+        size_t max_persist = (size_t)prop.persistingL2CacheMaxSize;
+        attr.accessPolicyWindow.num_bytes = (num_bytes < max_persist) ? num_bytes : max_persist;
+        attr.accessPolicyWindow.hitRatio = 1.0f;
+        attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+        attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+    }
+}
+#endif
+
 typedef struct {
     int       dev;
     int8_t*   d_Ap[2];
@@ -344,6 +362,14 @@ void cp_gpu_init(int* devs, int ndev)
         g->dev = devs[i];
         CU_CHECK(cudaSetDevice(g->dev));
         CU_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
+        cudaDeviceProp prop{};
+        if(cudaGetDeviceProperties(&prop, g->dev) == cudaSuccess && prop.persistingL2CacheMaxSize > 0){
+            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, prop.persistingL2CacheMaxSize);
+        }
+#endif
+
         if(g_cutlass_fused && !cp_cutlass_device_ok(g->dev)){
             fprintf(stderr,
                     "[gpu] GPU%d: --cutlass-fused needs Pascal SIMT (compute capability <= 7.5)\n",
@@ -1621,9 +1647,10 @@ static int gpu_scan_device_period(
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                CU_CHECK(cudaDeviceSynchronize());
+                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                 int f = 0;
-                CU_CHECK(cudaMemcpy(&f, g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                CU_CHECK(cudaMemcpyAsync(&f, g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
+                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                 if(f && !found){
                     found = 1;
                     CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
@@ -1729,9 +1756,10 @@ static int gpu_scan_device(
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                CU_CHECK(cudaDeviceSynchronize());
+                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                 int f = 0;
-                CU_CHECK(cudaMemcpy(&f, g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                CU_CHECK(cudaMemcpyAsync(&f, g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
+                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                 if(f && !found){
                     found = 1;
                     CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
@@ -1900,6 +1928,10 @@ int cp_gpu_mine_attempt(
     for(int i = 0; i < g_ngpu; i++){
         CU_CHECK(cudaSetDevice(g_gpus[i].dev));
         CU_CHECK(cudaStreamWaitEvent(g_gpus[i].stream_compute, g_gpus[i].event_prep_done[curr_slot], 0));
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
+        size_t szAp = (size_t)m * K_DIM;
+        cp_gpu_set_l2_persistence(g_gpus[i].dev, g_gpus[i].stream_compute, g_gpus[i].d_Ap[curr_slot], szAp);
+#endif
     }
 
     // 3. Launch next attempt preparation on stream_prep asynchronously (overlapped with curr_slot compute!)
