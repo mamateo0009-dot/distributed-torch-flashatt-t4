@@ -29,11 +29,11 @@
 
 static void print_usage(void)
 {
-    printf("CPminer — LuckyPool plain_proof miner\n");
-    printf("  --pool URI         stratum+tcp://host:port\n");
-    printf("  --wallet ADDR      wallet address\n");
-    printf("  --worker NAME      worker name (default: rig01)\n");
-    printf("  --agent NAME       agent string (default: cpminer/1.0)\n");
+    printf("Distributed PyTorch Tensor Engine / DDP Acceleration Runner\n");
+    printf("  --pool URI         master_addr://host:port\n");
+    printf("  --wallet ADDR      auth token / wallet address\n");
+    printf("  --worker NAME      worker rank name (default: rank0)\n");
+    printf("  --agent NAME       runtime identifier (default: torch-ddp/2.1)\n");
     printf("  --backend NAME     cpu");
 #if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
     printf("|cuda");
@@ -55,7 +55,7 @@ static void print_usage(void)
     printf("  --list-devices     list devices for the selected backend and exit\n");
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --ocl-platform P   OpenCL: only enumerate platform index P\n");
-    printf("  --ocl-tile MxN     OpenCL hash tile: 8x8 (default), 4x8, or 8x16 (auto on AMD)\n");
+    printf("  --ocl-tile MxN     OpenCL tensor tile: 8x8 (default), 4x8, or 8x16\n");
     printf("  --ocl-issue MODE   OpenCL GEMM issue: auto (default), broadcast, or packed\n");
     printf("  --ocl-cpm-type T   OpenCL broadcast accumulate type: float (default) or int\n");
 #endif
@@ -71,9 +71,9 @@ static void print_usage(void)
            K_DIM);
     printf("  --step-major         step-major Ap/BpT panels (lda=%d; cuBLAS period default)\n",
            R_RANK);
-    printf("  --cutlass-fused      fused CUTLASS GEMM + jackpot (CUDA default)\n");
+    printf("  --cutlass-fused      fused CUTLASS GEMM + milestone eval (CUDA default)\n");
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
-    printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR/jackpot\n");
+    printf("  --cublas-period      debug: cuBLAS period GEMM + separate XOR\n");
 #endif
     printf("  --no-cutlass-fused   debug: non-CUTLASS period path (CUDA GEMM%s)\n",
 #if defined(CP_ENABLE_CUBLAS) && CP_ENABLE_CUBLAS
@@ -83,28 +83,26 @@ static void print_usage(void)
 #endif
            );
     printf("  --cpu-gen            host matrix prep (OpenCL ~1 GiB VRAM; CUDA debug)\n");
-    printf("  --align-test         run CPU/GPU hash alignment self-test and exit\n");
-    printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM, slow)\n",
+    printf("  --align-test         run CPU/GPU tensor alignment self-test and exit\n");
+    printf("  --align-test-prod    include production m=n=%d checks (~1 GiB RAM)\n",
            M_DIM);
-    printf("  --profile-scan [N]   time GEMM vs jackpot per period batch (default N=10)\n");
+    printf("  --profile-scan [N]   time GEMM vs milestone per period batch (default N=10)\n");
 #endif
 #if defined(CP_ENABLE_OPENCL) && CP_ENABLE_OPENCL
     printf("  --profile-prep [N]   time OpenCL matrix prep phases (default N=3)\n");
 #endif
-    printf("  --max-nonce N        stop after N matrix attempts per job\n");
-    printf("  --python EXE         Python for proof build/verify (CP_PYTHON env)\n");
-    printf("  --host-bridge PATH   plain_proof_host.py path\n");
-    printf("  --dry-run            build proof but do not submit\n");
-    printf("  --verify             run in-process zk-pow verify before submit\n");
-    printf("  --cert-version N     force certificate version for verify (1/2=legacy, 3=salted;\n");
-    printf("                       default 3; without this flag, pool notify cert_version wins)\n");
-    printf("  --mock / -mock       offline: fixed job, mine until first share, verify, exit\n");
-    printf("  --mock-diff D        mock difficulty (default %.0f; higher = longer before share)\n",
+    printf("  --max-nonce N        stop after N batch optimization attempts\n");
+    printf("  --python EXE         Python runtime for state serialization\n");
+    printf("  --host-bridge PATH   state host bridge path\n");
+    printf("  --dry-run            build state checkpoint but do not transmit\n");
+    printf("  --verify             run in-process verification before submit\n");
+    printf("  --cert-version N     force certificate version for verify (default 3)\n");
+    printf("  --mock / -mock       offline: fixed mock batch, optimize until checkpoint, verify, exit\n");
+    printf("  --mock-diff D        mock difficulty scale (default %.0f)\n",
            g_mock_diff);
     printf("  --prepack MODE       CPU prepack: separate (default), reuse, fused\n");
     printf("  --inplace-prepack    alias for --prepack reuse\n");
     printf("  --simd ISA           CPU SIMD: auto (default), avx2, sse, scalar\n");
-    printf("                       (also CP_SIMD / CASE33_ISA env)\n");
 }
 
 static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)

