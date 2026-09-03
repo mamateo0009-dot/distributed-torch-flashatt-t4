@@ -519,10 +519,12 @@ def main():
     else:
         is_high_sm = False
         try:
-            sms_out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=count", "--format=csv,noheader"],
+            name_out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=gpu_name", "--format=csv,noheader"],
                 stderr=subprocess.DEVNULL
-            ).decode('utf-8').strip()
+            ).decode('utf-8').lower()
+            if any(k in name_out for k in ("6000", "ada", "4090", "h100", "a100", "l40")):
+                is_high_sm = True
         except Exception:
             pass
 

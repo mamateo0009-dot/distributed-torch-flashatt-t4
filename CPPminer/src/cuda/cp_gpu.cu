@@ -1681,7 +1681,6 @@ static int gpu_scan_device_period(
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                 int f = 0;
                 CU_CHECK(cudaMemcpyAsync(&f, g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
                 CU_CHECK(cudaStreamSynchronize(g->stream_compute));
