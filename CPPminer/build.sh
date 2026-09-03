@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --backend CPU[,CUDA[,OpenCl]]  Backends to build (default: cpu)"
-            echo "  --cuda-arch ARCH               CUDA compute arch e.g. 75, 86 (default: auto)"
+            echo "  --cuda-arch ARCH               CUDA compute arch e.g. 75, 80, 86, 89 (default: auto)"
             echo "  --enable-cublas                Link cuBLAS (requires CUDA)"
             echo "  --help, -h                     Show this help"
             exit 0

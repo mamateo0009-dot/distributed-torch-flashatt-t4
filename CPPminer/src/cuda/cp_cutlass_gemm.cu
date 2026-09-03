@@ -27,6 +27,11 @@ static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128StepMajorTensorOp
 static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajorTensorOp>
     g_fused_row_major_tensorop[MAX_GPUS];
 
+static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128StepMajorSm80TensorOp>
+    g_fused_step_major_sm80_tensorop[MAX_GPUS];
+static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajorSm80TensorOp>
+    g_fused_row_major_sm80_tensorop[MAX_GPUS];
+
 static int g_configured_attributes[MAX_GPUS] = {0};
 
 static void cp_cutlass_configure_attributes(int dev)
@@ -39,6 +44,9 @@ static void cp_cutlass_configure_attributes(int dev)
 
   const void* tensorop_ptr = (const void*)cutlass::Kernel<typename cp_cutlass::Gemm128x128RowMajorTensorOp::GemmKernel>;
   cudaFuncSetAttribute(tensorop_ptr, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+
+  const void* sm80_ptr = (const void*)cutlass::Kernel<typename cp_cutlass::Gemm128x128RowMajorSm80TensorOp::GemmKernel>;
+  cudaFuncSetAttribute(sm80_ptr, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
   g_configured_attributes[dev_idx] = 1;
 }
 
@@ -48,7 +56,7 @@ int cp_cutlass_device_ok(int dev)
   if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
     return 0;
   }
-  /* Supports Pascal (sm_61), Volta (sm_70), Turing (sm_75), and newer. */
+  /* Supports Pascal (sm_61), Volta (sm_70), Turing (sm_75), Ampere (sm_80/86), Ada (sm_89), and newer. */
   return prop.major >= 6;
 }
 
@@ -58,12 +66,14 @@ int cp_cutlass_is_tensorop_supported(int dev)
   if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
     return 0;
   }
-  return (prop.major == 7 && prop.minor == 5) ? 1 : 0;
+  if (prop.major == 7 && prop.minor == 5) return 1; // Turing (sm_75)
+  if (prop.major == 8 && (prop.minor == 0 || prop.minor == 6 || prop.minor == 9)) return 2; // Ampere/Ada (sm_80, sm_86, sm_89)
+  return 0;
 }
 
-static bool cp_cutlass_is_sm75(int dev)
+static int cp_cutlass_get_arch_mode(int dev)
 {
-  return cp_cutlass_is_tensorop_supported(dev) != 0;
+  return cp_cutlass_is_tensorop_supported(dev);
 }
 
 size_t cp_cutlass_tiles_per_batch(int row_batch_count, int col_batch_count)
@@ -109,11 +119,24 @@ int cp_cutlass_period_batch(
   cutlass::Status st = cutlass::Status::kErrorInternal;
   cp_cutlass_configure_attributes(dev);
 
-  const bool use_tensorop = cp_cutlass_is_sm75(dev);
-
+  const int arch_mode = cp_cutlass_get_arch_mode(dev);
   const int dev_idx = (dev >= 0 && dev < MAX_GPUS) ? dev : 0;
 
-  if (use_tensorop) {
+  if (arch_mode == 2) {
+    // Ada Lovelace (sm_89) / Ampere (sm_80, sm_86) TensorOp m16n8k32
+    if (step_major) {
+      CP_CUTLASS_CHECK(g_fused_step_major_sm80_tensorop[dev_idx].initialize(
+          M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
+          d_tile_xor, cta_cols, tile_count, jackpot));
+      st = g_fused_step_major_sm80_tensorop[dev_idx](stream);
+    } else {
+      CP_CUTLASS_CHECK(g_fused_row_major_sm80_tensorop[dev_idx].initialize(
+          M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
+          d_tile_xor, cta_cols, tile_count, jackpot));
+      st = g_fused_row_major_sm80_tensorop[dev_idx](stream);
+    }
+  } else if (arch_mode == 1) {
+    // Turing (sm_75) TensorOp m8n8k16
     if (step_major) {
       CP_CUTLASS_CHECK(g_fused_step_major_tensorop[dev_idx].initialize(
           M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),
@@ -126,6 +149,7 @@ int cp_cutlass_period_batch(
       st = g_fused_row_major_tensorop[dev_idx](stream);
     }
   } else {
+    // Pascal (sm_61) / Volta SIMT DP4A
     if (step_major) {
       CP_CUTLASS_CHECK(g_fused_step_major[dev_idx].initialize(
           M, N_fat, K, m, n, const_cast<int8_t*>(d_A), const_cast<int8_t*>(d_B),

@@ -55,6 +55,13 @@ static void cp_gpu_set_l2_persistence(int dev, cudaStream_t stream, void* ptr, s
         memset(&attr, 0, sizeof(attr));
         attr.accessPolicyWindow.base_ptr = ptr;
         size_t max_persist = (size_t)prop.persistingL2CacheMaxSize;
+        // On GPUs with L2 >= 64MB (e.g. RTX 6000 Ada with 96MB L2), target up to 72MB persisting window
+        if((size_t)prop.l2CacheSize >= (64ULL * 1024 * 1024)){
+            size_t ada_target = 72ULL * 1024 * 1024;
+            if(ada_target <= max_persist){
+                max_persist = ada_target;
+            }
+        }
         attr.accessPolicyWindow.num_bytes = (num_bytes < max_persist) ? num_bytes : max_persist;
         attr.accessPolicyWindow.hitRatio = 1.0f;
         attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
@@ -366,7 +373,26 @@ void cp_gpu_init(int* devs, int ndev)
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
         cudaDeviceProp prop{};
         if(cudaGetDeviceProperties(&prop, g->dev) == cudaSuccess && prop.persistingL2CacheMaxSize > 0){
-            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, prop.persistingL2CacheMaxSize);
+            size_t persist_limit = (size_t)prop.persistingL2CacheMaxSize;
+            if((size_t)prop.l2CacheSize >= (64ULL * 1024 * 1024)){
+                size_t ada_target = 72ULL * 1024 * 1024;
+                if(ada_target <= (size_t)prop.persistingL2CacheMaxSize){
+                    persist_limit = ada_target;
+                }
+            }
+            CU_CHECK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_limit));
+            printf("[gpu] GPU%d: %s (sm_%d%d, %d SMs, L2 %zu MB) -> Persisting L2 set to %zu MB\n",
+                   g->dev, prop.name, prop.major, prop.minor, prop.multiProcessorCount,
+                   (size_t)prop.l2CacheSize / (1024 * 1024), persist_limit / (1024 * 1024));
+            fflush(stdout);
+
+            // Auto-scale batch defaults for massive SM GPUs (e.g. RTX 6000 Ada with 142 SMs)
+            if(prop.major >= 8 && prop.multiProcessorCount >= 100 && g_row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT){
+                g_row_period_batch = 256;
+                printf("[gpu] GPU%d: Detected %d SMs (major>=8) -> auto-optimized row_period_batch=256\n",
+                       g->dev, prop.multiProcessorCount);
+                fflush(stdout);
+            }
         }
 #endif
 
@@ -537,7 +563,15 @@ static void ensure_buffers(GpuCtx* g, int m, int n)
         } else {
             int safe_row_batch = g_row_period_batch;
             int safe_col_batch = g_col_period_batch;
-            while(pp_hist_batch_bytes(safe_row_batch, safe_col_batch) > (256ULL * 1024 * 1024)){
+
+            // On high-memory GPUs (Ada 48GB), permit up to 1024MB C_hist before throttling
+            size_t free_mem = 0, total_mem = 0;
+            cudaMemGetInfo(&free_mem, &total_mem);
+            size_t max_hist_budget = (free_mem > (16ULL * 1024 * 1024 * 1024))
+                                     ? (1024ULL * 1024 * 1024)
+                                     : (256ULL * 1024 * 1024);
+
+            while(pp_hist_batch_bytes(safe_row_batch, safe_col_batch) > max_hist_budget){
                 if(safe_col_batch > 32) safe_col_batch /= 2;
                 else if(safe_row_batch > 1) safe_row_batch /= 2;
                 else break;

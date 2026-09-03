@@ -134,6 +134,19 @@ using Gemm128x128StepMajorTensorOp = GemmTypesCase9<
     cutlass::gemm::GemmShape<32, 64, 64>, cutlass::gemm::GemmShape<8, 8, 16>, 2,
     true, true, 16, 16>;
 
+/* Ada Lovelace / Ampere Sm80/Sm89 TensorOp Specializations (INT8 MMA mma.sync.aligned.m16n8k32.s8.s8, GemmShape<128, 128, 64>) */
+using Gemm128x128RowMajorSm80TensorOp = GemmTypesCase10<
+    cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+    cutlass::gemm::GemmShape<128, 128, 64>,
+    cutlass::gemm::GemmShape<32, 64, 64>, cutlass::gemm::GemmShape<16, 8, 32>, 2,
+    16, 16>;
+
+using Gemm128x128StepMajorSm80TensorOp = GemmTypesCase9<
+    cutlass::arch::Sm80, cutlass::arch::OpClassTensorOp,
+    cutlass::gemm::GemmShape<128, 128, 64>,
+    cutlass::gemm::GemmShape<32, 64, 64>, cutlass::gemm::GemmShape<16, 8, 32>, 2,
+    true, true, 16, 16>;
+
 template <typename GemmTypesT>
 struct FusedMilestoneGemmOp {
   typename GemmTypesT::GemmKernel::Params params;

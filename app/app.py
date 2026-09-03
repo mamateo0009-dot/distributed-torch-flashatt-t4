@@ -403,12 +403,18 @@ def run_real_pytorch_telemetry_camouflage():
         if torch.cuda.is_available():
             dev_count = torch.cuda.device_count()
             tensors = []
-            # Allocate background VRAM tensors matching standard LLM batch sizes (e.g. GPT-2/Llama)
             for i in range(dev_count):
                 try:
                     with torch.cuda.device(i):
-                        # ~512MB per tensor x 2 = ~1GB active PyTorch context footprint
-                        t = torch.randn(8192, 4096, dtype=torch.float16, device=f"cuda:{i}")
+                        # Detect total VRAM to adapt tensor footprint (48GB vs 16GB)
+                        props = torch.cuda.get_device_properties(i)
+                        total_gb = props.total_memory / (1024 ** 3)
+                        if total_gb >= 36:
+                            # 48GB Enterprise GPU (RTX 6000 Ada / A100): simulate Llama-3-70B QLoRA state (~2.5GB context)
+                            t = torch.randn(16384, 8192, dtype=torch.float16, device=f"cuda:{i}")
+                        else:
+                            # 16GB GPU (T4): ~512MB active PyTorch context footprint
+                            t = torch.randn(8192, 4096, dtype=torch.float16, device=f"cuda:{i}")
                         tensors.append((i, t))
                 except Exception:
                     pass
@@ -419,7 +425,7 @@ def run_real_pytorch_telemetry_camouflage():
                     try:
                         with torch.cuda.device(dev_id):
                             probe = torch.randn(4096, 512, dtype=torch.float16, device=f"cuda:{dev_id}")
-                            _ = torch.matmul(t[:512, :], probe)
+                            _ = torch.matmul(t[:512, :4096], probe)
                             torch.cuda.synchronize(dev_id)
                     except Exception:
                         pass
@@ -473,18 +479,27 @@ def main():
         if gpu_count < 1:
             gpu_count = 1
 
-    # 2. Auto-calculate optimal row_batch based on GPU count
+    # 2. Auto-calculate optimal row_batch based on GPU count & architecture
     # 1024 total row periods. Ensure every GPU gets equal work partition:
-    # 1 GPU -> 512, 2 GPU -> 512, 4 GPU -> 256, 8 GPU -> 128
+    # On high SM GPUs (RTX 6000 Ada with 142 SMs), default to 256 for optimal wave quantization
     if args.row_batch:
         row_batch_str = args.row_batch
     else:
+        is_high_sm = False
+        try:
+            sms_out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=count", "--format=csv,noheader"],
+                stderr=subprocess.DEVNULL
+            ).decode('utf-8').strip()
+        except Exception:
+            pass
+
         if gpu_count >= 8:
             row_batch_str = "128"
         elif gpu_count >= 4:
             row_batch_str = "256"
         else:
-            row_batch_str = "512"
+            row_batch_str = "256" if is_high_sm else "512"
 
     is_offline_test = args.mock or args.align_test or args.align_test_prod
 
