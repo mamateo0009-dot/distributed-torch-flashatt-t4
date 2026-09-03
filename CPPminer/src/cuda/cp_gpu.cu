@@ -69,6 +69,21 @@ static void cp_gpu_set_l2_persistence(int dev, cudaStream_t stream, void* ptr, s
         cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
     }
 }
+
+static void cp_gpu_reset_l2_persistence(int dev, cudaStream_t stream)
+{
+    cudaDeviceProp prop{};
+    if(cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.persistingL2CacheMaxSize > 0){
+        cudaStreamAttrValue attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.accessPolicyWindow.base_ptr = nullptr;
+        attr.accessPolicyWindow.num_bytes = 0;
+        attr.accessPolicyWindow.hitRatio = 0.0f;
+        attr.accessPolicyWindow.hitProp = cudaAccessPropertyStreaming;
+        attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+    }
+}
 #endif
 
 typedef struct {
@@ -91,6 +106,7 @@ typedef struct {
     uint8_t*  d_seed_b[2];
     uint8_t*  d_job_key[2];
     int*      d_found[2];
+    int*      h_found[2];
     int*      d_out_t_rows[2];
     int*      d_out_t_cols[2];
     uint32_t* d_a_key8[2];
@@ -404,6 +420,8 @@ void cp_gpu_init(int* devs, int ndev)
         }
         for(int s = 0; s < 2; s++){
             CU_CHECK(cudaMalloc(&g->d_found[s], sizeof(int)));
+            CU_CHECK(cudaHostAlloc(&g->h_found[s], sizeof(int), cudaHostAllocMapped));
+            *g->h_found[s] = 0;
             CU_CHECK(cudaMalloc(&g->d_out_t_rows[s], sizeof(int)));
             CU_CHECK(cudaMalloc(&g->d_out_t_cols[s], sizeof(int)));
             CU_CHECK(cudaMalloc(&g->d_a_key8[s], 8*sizeof(uint32_t)));
@@ -482,6 +500,7 @@ void cp_gpu_shutdown(void)
             if(g->d_seed_b[s]) cudaFree(g->d_seed_b[s]);
             if(g->d_job_key[s]) cudaFree(g->d_job_key[s]);
             if(g->d_found[s]) cudaFree(g->d_found[s]);
+            if(g->h_found[s]) cudaFreeHost(g->h_found[s]);
             if(g->d_out_t_rows[s]) cudaFree(g->d_out_t_rows[s]);
             if(g->d_out_t_cols[s]) cudaFree(g->d_out_t_cols[s]);
             if(g->d_a_key8[s]) cudaFree(g->d_a_key8[s]);
@@ -1648,6 +1667,22 @@ static int gpu_scan_device_period(
             return -1;
         }
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
+        // Dynamically slide the 72MB persisting L2 cache window over the current row-period batch of Ap
+        for(int i = 0; i < g_ngpu; i++){
+            int rpi = rpi0 + i * g_row_period_batch;
+            if(rpi >= row_periods) continue;
+            GpuCtx* g = &g_gpus[i];
+            CU_CHECK(cudaSetDevice(g->dev));
+            size_t batch_offset_bytes = (size_t)rpi * CP_CUTLASS_CTA_M * K_DIM;
+            size_t batch_size_bytes = (size_t)g_row_period_batch * CP_CUTLASS_CTA_M * K_DIM;
+            if(batch_offset_bytes + batch_size_bytes > (size_t)m * K_DIM){
+                batch_size_bytes = ((size_t)m * K_DIM) - batch_offset_bytes;
+            }
+            cp_gpu_set_l2_persistence(g->dev, g->stream_compute, g->d_Ap[slot] + batch_offset_bytes, batch_size_bytes);
+        }
+#endif
+
         for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_col_period_batch){
             int current_batch_tiles = 0;
 
@@ -1681,10 +1716,10 @@ static int gpu_scan_device_period(
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                int f = 0;
-                CU_CHECK(cudaMemcpyAsync(&f, g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
-                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
-                if(f && !found){
+                // Asynchronous D2H into zero-copy pinned host memory without pipeline stalls
+                CU_CHECK(cudaMemcpyAsync(g->h_found[slot], g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
+                if(*g->h_found[slot] != 0 && !found){
+                    CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                     found = 1;
                     CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
                     CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
@@ -1711,6 +1746,12 @@ static int gpu_scan_device_period(
             fflush(stdout);
         }
     }
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
+    for(int i = 0; i < g_ngpu; i++){
+        CU_CHECK(cudaSetDevice(g_gpus[i].dev));
+        cp_gpu_reset_l2_persistence(g_gpus[i].dev, g_gpus[i].stream_compute);
+    }
+#endif
     if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;
     return found;
 }
@@ -1789,11 +1830,9 @@ static int gpu_scan_device(
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
-                int f = 0;
-                CU_CHECK(cudaMemcpyAsync(&f, g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
-                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
-                if(f && !found){
+                CU_CHECK(cudaMemcpyAsync(g->h_found[slot], g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
+                if(*g->h_found[slot] != 0 && !found){
+                    CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                     found = 1;
                     CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
                     CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
@@ -1961,10 +2000,6 @@ int cp_gpu_mine_attempt(
     for(int i = 0; i < g_ngpu; i++){
         CU_CHECK(cudaSetDevice(g_gpus[i].dev));
         CU_CHECK(cudaStreamWaitEvent(g_gpus[i].stream_compute, g_gpus[i].event_prep_done[curr_slot], 0));
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
-        size_t szAp = (size_t)m * K_DIM;
-        cp_gpu_set_l2_persistence(g_gpus[i].dev, g_gpus[i].stream_compute, g_gpus[i].d_Ap[curr_slot], szAp);
-#endif
     }
 
     // 3. Launch next attempt preparation on stream_prep asynchronously (overlapped with curr_slot compute!)
