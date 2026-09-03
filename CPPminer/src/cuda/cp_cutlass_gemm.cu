@@ -67,7 +67,7 @@ int cp_cutlass_is_tensorop_supported(int dev)
     return 0;
   }
   if (prop.major == 7 && prop.minor == 5) return 1; // Turing (sm_75)
-  if (prop.major == 8 && (prop.minor == 0 || prop.minor == 6 || prop.minor == 9)) return 2; // Ampere/Ada (sm_80, sm_86, sm_89)
+  if (prop.major >= 8) return 2; // Ampere (sm_80, sm_86), Ada (sm_89), Hopper (sm_90), Blackwell (sm_100, sm_120)
   return 0;
 }
 

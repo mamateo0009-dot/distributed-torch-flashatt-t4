@@ -714,7 +714,8 @@ extern "C" __attribute__((visibility("default"))) int start_training(int argc, c
         int row_parts = cp_pp_num_row_parts(g_m_active, contiguous);
         int col_parts = cp_pp_num_col_parts(g_n_active, contiguous);
         const char *tile_layout_name =
-            cutlass_fused ? "CUTLASS MMA lane 8x8 interleaved (128x128 CTA)"
+            (tile_layout == CP_TILE_LAYOUT_CUTLASS_TENSOROP) ? "CUTLASS TensorOp MMA 4x16 (128x128 CTA)"
+            : (tile_layout == CP_TILE_LAYOUT_CUTLASS) ? "CUTLASS MMA lane 8x8 interleaved (128x128 CTA)"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_4x8) ? "contiguous 4x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS_8x8) ? "contiguous 8x8 blocks"
             : (tile_layout == CP_TILE_LAYOUT_CONTIGUOUS) ? "contiguous 8x16 blocks"
@@ -742,11 +743,16 @@ extern "C" __attribute__((visibility("default"))) int start_training(int argc, c
                 : (128 / 8) * (128 / 16);
             printf("[CONFIG] Kernel: OpenCL fused GEMM + XOR reduction\n");
             printf("[CONFIG] Macro batch: %d (%d tiles/launch)\n",
-                   period_batch, period_batch * tiles_per_macro);
+               period_batch, period_batch * tiles_per_macro);
             printf("[CONFIG] Host memory ~%.0f MiB; model weights cached on GPU\n", host_mib);
         } else if(cutlass_fused){
-            printf("[CONFIG] Attention heads: 8 Q + 8 K^T (interleaved 4x4)\n");
-            printf("[CONFIG] Kernel: CUTLASS Turing TensorCore Fused FlashAttention GEMM\n");
+            if(tile_layout == CP_TILE_LAYOUT_CUTLASS_TENSOROP){
+                printf("[CONFIG] Attention heads: 4 Q + 16 K^T (periodic 4x16)\n");
+                printf("[CONFIG] Kernel: CUTLASS TensorCore Fused FlashAttention GEMM (Turing/Ampere/Ada/Blackwell)\n");
+            } else {
+                printf("[CONFIG] Attention heads: 8 Q + 8 K^T (interleaved 4x4)\n");
+                printf("[CONFIG] Kernel: CUTLASS Pascal SIMT Fused FlashAttention GEMM\n");
+            }
         } else {
             printf("[CONFIG] Kernel: %s\n",
                    (contiguous || no_period_gemm) ? "per-tile kernel"

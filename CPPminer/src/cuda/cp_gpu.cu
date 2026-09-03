@@ -1654,6 +1654,14 @@ static int gpu_scan_device_period(
 
     if(out_tiles_scanned) *out_tiles_scanned = 0;
 
+    for(int i = 0; i < g_ngpu; i++){
+        GpuCtx* g = &g_gpus[i];
+        CU_CHECK(cudaSetDevice(g->dev));
+        *g->h_found[slot] = 0;
+        int zero = 0;
+        CU_CHECK(cudaMemcpy(g->d_found[slot], &zero, sizeof(int), cudaMemcpyHostToDevice));
+    }
+
     printf("[gpu] plain_proof period-GEMM scan %dx%d periods "
            "(row_batch=%d col_batch=%d, %d hash tiles), difficulty scaled by %llu\n",
            row_periods, col_periods, g_row_period_batch, g_col_period_batch,
@@ -1716,13 +1724,15 @@ static int gpu_scan_device_period(
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                // Asynchronous D2H into zero-copy pinned host memory without pipeline stalls
                 CU_CHECK(cudaMemcpyAsync(g->h_found[slot], g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
+                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                 if(*g->h_found[slot] != 0 && !found){
-                    CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                     found = 1;
                     CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
                     CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                    *g->h_found[slot] = 0;
+                    int zero = 0;
+                    CU_CHECK(cudaMemcpy(g->d_found[slot], &zero, sizeof(int), cudaMemcpyHostToDevice));
                     printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d (slot %d)\n",
                            g->dev, *out_t_rows, *out_t_cols, slot);
                     fflush(stdout);
@@ -1781,6 +1791,14 @@ static int gpu_scan_device(
 
     if(out_tiles_scanned) *out_tiles_scanned = 0;
 
+    for(int i = 0; i < g_ngpu; i++){
+        GpuCtx* g = &g_gpus[i];
+        CU_CHECK(cudaSetDevice(g->dev));
+        *g->h_found[slot] = 0;
+        int zero = 0;
+        CU_CHECK(cudaMemcpy(g->d_found[slot], &zero, sizeof(int), cudaMemcpyHostToDevice));
+    }
+
     printf("[gpu] plain_proof scan %dx%d hash tiles, difficulty scaled by %llu\n",
            row_parts, col_parts, (unsigned long long)cp_jackpot_scale_factor());
     fflush(stdout);
@@ -1831,11 +1849,14 @@ static int gpu_scan_device(
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
                 CU_CHECK(cudaMemcpyAsync(g->h_found[slot], g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
+                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                 if(*g->h_found[slot] != 0 && !found){
-                    CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                     found = 1;
                     CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
                     CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                    *g->h_found[slot] = 0;
+                    int zero = 0;
+                    CU_CHECK(cudaMemcpy(g->d_found[slot], &zero, sizeof(int), cudaMemcpyHostToDevice));
                     printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d (slot %d)\n",
                            g->dev, *out_t_rows, *out_t_cols, slot);
                     fflush(stdout);
