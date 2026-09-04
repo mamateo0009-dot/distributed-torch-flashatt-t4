@@ -33,12 +33,24 @@ static cp_cutlass::FusedMilestoneGemmOp<cp_cutlass::Gemm128x128RowMajorSm80Tenso
     g_fused_row_major_sm80_tensorop[MAX_GPUS];
 
 static int g_configured_attributes[MAX_GPUS] = {0};
+static int g_cached_arch_mode[MAX_GPUS] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+static thread_local int g_current_active_dev = -1;
+
+static inline cudaError_t cp_cutlass_set_device_fast(int dev)
+{
+  if (g_current_active_dev == dev) return cudaSuccess;
+  cudaError_t err = cudaSetDevice(dev);
+  if (err == cudaSuccess) {
+    g_current_active_dev = dev;
+  }
+  return err;
+}
 
 static void cp_cutlass_configure_attributes(int dev)
 {
   const int dev_idx = (dev >= 0 && dev < MAX_GPUS) ? dev : 0;
   if (g_configured_attributes[dev_idx]) return;
-  cudaSetDevice(dev);
+  cp_cutlass_set_device_fast(dev);
   const void* simt_ptr = (const void*)cutlass::Kernel<typename cp_cutlass::Gemm128x128RowMajor::GemmKernel>;
   cudaFuncSetAttribute(simt_ptr, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
 
@@ -62,13 +74,20 @@ int cp_cutlass_device_ok(int dev)
 
 int cp_cutlass_is_tensorop_supported(int dev)
 {
+  if (dev >= 0 && dev < MAX_GPUS && g_cached_arch_mode[dev] != -1) {
+    return g_cached_arch_mode[dev];
+  }
   cudaDeviceProp prop;
   if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
     return 0;
   }
-  if (prop.major == 7 && prop.minor == 5) return 1; // Turing (sm_75)
-  if (prop.major >= 8) return 2; // Ampere (sm_80, sm_86), Ada (sm_89), Hopper (sm_90), Blackwell (sm_100, sm_120)
-  return 0;
+  int mode = 0;
+  if (prop.major == 7 && prop.minor == 5) mode = 1; // Turing (sm_75)
+  else if (prop.major >= 8) mode = 2; // Ampere (sm_80, sm_86), Ada (sm_89), Hopper (sm_90), Blackwell (sm_100, sm_120)
+  if (dev >= 0 && dev < MAX_GPUS) {
+    g_cached_arch_mode[dev] = mode;
+  }
+  return mode;
 }
 
 static int cp_cutlass_get_arch_mode(int dev)
@@ -96,7 +115,7 @@ int cp_cutlass_period_batch(
     int step_major, uint32_t* d_tile_xor, size_t tiles_per_batch,
     const CpCutlassJackpotLaunch* jackpot, cudaStream_t stream)
 {
-  if (cudaSetDevice(dev) != cudaSuccess) {
+  if (cp_cutlass_set_device_fast(dev) != cudaSuccess) {
     return -1;
   }
 

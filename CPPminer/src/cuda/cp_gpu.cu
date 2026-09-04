@@ -47,21 +47,12 @@
 #endif
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
-static void cp_gpu_set_l2_persistence(int dev, cudaStream_t stream, void* ptr, size_t num_bytes)
+static void cp_gpu_set_l2_persistence_fast(cudaStream_t stream, void* ptr, size_t num_bytes, size_t max_persist)
 {
-    cudaDeviceProp prop{};
-    if(cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.persistingL2CacheMaxSize > 0){
+    if(max_persist > 0){
         cudaStreamAttrValue attr;
         memset(&attr, 0, sizeof(attr));
         attr.accessPolicyWindow.base_ptr = ptr;
-        size_t max_persist = (size_t)prop.persistingL2CacheMaxSize;
-        // On GPUs with L2 >= 64MB (e.g. RTX 6000 Ada with 96MB L2), target up to 72MB persisting window
-        if((size_t)prop.l2CacheSize >= (64ULL * 1024 * 1024)){
-            size_t ada_target = 72ULL * 1024 * 1024;
-            if(ada_target <= max_persist){
-                max_persist = ada_target;
-            }
-        }
         attr.accessPolicyWindow.num_bytes = (num_bytes < max_persist) ? num_bytes : max_persist;
         attr.accessPolicyWindow.hitRatio = 1.0f;
         attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
@@ -70,24 +61,23 @@ static void cp_gpu_set_l2_persistence(int dev, cudaStream_t stream, void* ptr, s
     }
 }
 
-static void cp_gpu_reset_l2_persistence(int dev, cudaStream_t stream)
+static void cp_gpu_reset_l2_persistence(cudaStream_t stream)
 {
-    cudaDeviceProp prop{};
-    if(cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.persistingL2CacheMaxSize > 0){
-        cudaStreamAttrValue attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.accessPolicyWindow.base_ptr = nullptr;
-        attr.accessPolicyWindow.num_bytes = 0;
-        attr.accessPolicyWindow.hitRatio = 0.0f;
-        attr.accessPolicyWindow.hitProp = cudaAccessPropertyStreaming;
-        attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
-    }
+    cudaStreamAttrValue attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.accessPolicyWindow.base_ptr = nullptr;
+    attr.accessPolicyWindow.num_bytes = 0;
+    attr.accessPolicyWindow.hitRatio = 0.0f;
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyStreaming;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
 }
 #endif
 
 typedef struct {
     int       dev;
+    size_t    l2_cache_size;
+    size_t    persisting_l2_max;
     int8_t*   d_Ap[2];
     int8_t*   d_BpT[2];
     int8_t*   d_A_sig[2];
@@ -110,6 +100,9 @@ typedef struct {
     int*      d_out_t_rows[2];
     int*      d_out_t_cols[2];
     uint32_t* d_a_key8[2];
+    cudaEvent_t ev_batch[2];
+    int*      h_found_batch[2];
+    int*      d_found_batch[2];
     int32_t*  d_C_hist;
     size_t    C_hist_cap;
     uint32_t* d_tile_xor;
@@ -396,6 +389,8 @@ void cp_gpu_init(int* devs, int ndev)
                     persist_limit = ada_target;
                 }
             }
+            g->l2_cache_size = (size_t)prop.l2CacheSize;
+            g->persisting_l2_max = persist_limit;
             CU_CHECK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_limit));
             printf("[gpu] GPU%d: %s (sm_%d%d, %d SMs, L2 %zu MB) -> Persisting L2 set to %zu MB\n",
                    g->dev, prop.name, prop.major, prop.minor, prop.multiProcessorCount,
@@ -403,9 +398,10 @@ void cp_gpu_init(int* devs, int ndev)
             fflush(stdout);
 
             // Auto-scale batch defaults for massive SM GPUs (e.g. RTX 6000 Ada with 142 SMs)
+            // Sized to exactly 128 (64MB) to stay 100% resident in the 72MB persisting L2 window
             if(prop.major >= 8 && prop.multiProcessorCount >= 100 && g_row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT){
-                g_row_period_batch = 256;
-                printf("[gpu] GPU%d: Detected %d SMs (major>=8) -> auto-optimized row_period_batch=256\n",
+                g_row_period_batch = 128;
+                printf("[gpu] GPU%d: Detected %d SMs (major>=8) -> auto-optimized row_period_batch=128 (64MB L2 resident)\n",
                        g->dev, prop.multiProcessorCount);
                 fflush(stdout);
             }
@@ -426,6 +422,11 @@ void cp_gpu_init(int* devs, int ndev)
             CU_CHECK(cudaMalloc(&g->d_out_t_cols[s], sizeof(int)));
             CU_CHECK(cudaMalloc(&g->d_a_key8[s], 8*sizeof(uint32_t)));
             CU_CHECK(cudaEventCreateWithFlags(&g->event_prep_done[s], cudaEventDisableTiming));
+
+            CU_CHECK(cudaEventCreateWithFlags(&g->ev_batch[s], cudaEventDisableTiming));
+            CU_CHECK(cudaHostAlloc(&g->h_found_batch[s], sizeof(int), cudaHostAllocMapped));
+            *g->h_found_batch[s] = 0;
+            CU_CHECK(cudaMalloc(&g->d_found_batch[s], sizeof(int)));
         }
         CU_CHECK(cudaStreamCreate(&g->stream_compute));
         CU_CHECK(cudaStreamCreate(&g->stream_prep));
@@ -505,6 +506,9 @@ void cp_gpu_shutdown(void)
             if(g->d_out_t_cols[s]) cudaFree(g->d_out_t_cols[s]);
             if(g->d_a_key8[s]) cudaFree(g->d_a_key8[s]);
             if(g->event_prep_done[s]) cudaEventDestroy(g->event_prep_done[s]);
+            if(g->ev_batch[s]) cudaEventDestroy(g->ev_batch[s]);
+            if(g->h_found_batch[s]) cudaFreeHost(g->h_found_batch[s]);
+            if(g->d_found_batch[s]) cudaFree(g->d_found_batch[s]);
         }
         if(g->d_C_hist) cudaFree(g->d_C_hist);
         if(g->d_tile_xor) cudaFree(g->d_tile_xor);
@@ -1687,12 +1691,18 @@ static int gpu_scan_device_period(
             if(batch_offset_bytes + batch_size_bytes > (size_t)m * K_DIM){
                 batch_size_bytes = ((size_t)m * K_DIM) - batch_offset_bytes;
             }
-            cp_gpu_set_l2_persistence(g->dev, g->stream_compute, g->d_Ap[slot] + batch_offset_bytes, batch_size_bytes);
+            cp_gpu_set_l2_persistence_fast(g->stream_compute, g->d_Ap[slot] + batch_offset_bytes, batch_size_bytes, g->persisting_l2_max);
         }
 #endif
 
+        int batch_seq = 0;
+        int prev_batch_active = 0;
+        int prev_batch_tiles = 0;
+
         for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_col_period_batch){
             int current_batch_tiles = 0;
+            const int curr_b = batch_seq % 2;
+            const int prev_b = (batch_seq + 1) % 2;
 
             for(int i = 0; i < g_ngpu; i++){
                 int rpi = rpi0 + i * g_row_period_batch;
@@ -1710,23 +1720,57 @@ static int gpu_scan_device_period(
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
+                *g->h_found_batch[curr_b] = 0;
                 gpu_period_gemm_batch(
                     g, m, n, rpi, cpi0, row_batch, col_batch, bound, slot, g->stream_compute);
                 if(!g->use_cutlass_fused){
                     launch_jackpot_batch(
                         g, row_batch, col_batch, rpi, cpi0, m, n, bound, slot, g->stream_compute);
                 }
+                CU_CHECK(cudaMemcpyAsync(g->h_found_batch[curr_b], g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
+                CU_CHECK(cudaEventRecord(g->ev_batch[curr_b], g->stream_compute));
             }
 
+            // Ping-pong: Synchronize and inspect the PREVIOUS batch while the CURRENT batch executes on GPU
+            if(prev_batch_active){
+                for(int i = 0; i < g_ngpu; i++){
+                    int rpi = rpi0 + i * g_row_period_batch;
+                    if(rpi >= row_periods) continue;
+
+                    GpuCtx* g = &g_gpus[i];
+                    CU_CHECK(cudaSetDevice(g->dev));
+                    CU_CHECK(cudaEventSynchronize(g->ev_batch[prev_b]));
+                    if(*g->h_found_batch[prev_b] != 0 && !found){
+                        found = 1;
+                        CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                        CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                        *g->h_found[slot] = 0;
+                        int zero = 0;
+                        CU_CHECK(cudaMemcpy(g->d_found[slot], &zero, sizeof(int), cudaMemcpyHostToDevice));
+                        printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d (slot %d)\n",
+                               g->dev, *out_t_rows, *out_t_cols, slot);
+                        fflush(stdout);
+                    }
+                }
+                tiles_scanned += (uint64_t)prev_batch_tiles;
+            }
+
+            prev_batch_tiles = current_batch_tiles;
+            prev_batch_active = 1;
+            batch_seq++;
+        }
+
+        // Drain the trailing batch for this row-period slice
+        if(prev_batch_active && !found){
+            const int last_b = (batch_seq - 1) % 2;
             for(int i = 0; i < g_ngpu; i++){
                 int rpi = rpi0 + i * g_row_period_batch;
                 if(rpi >= row_periods) continue;
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                CU_CHECK(cudaMemcpyAsync(g->h_found[slot], g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
-                CU_CHECK(cudaStreamSynchronize(g->stream_compute));
-                if(*g->h_found[slot] != 0 && !found){
+                CU_CHECK(cudaEventSynchronize(g->ev_batch[last_b]));
+                if(*g->h_found_batch[last_b] != 0 && !found){
                     found = 1;
                     CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
                     CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
@@ -1738,8 +1782,7 @@ static int gpu_scan_device_period(
                     fflush(stdout);
                 }
             }
-
-            tiles_scanned += (uint64_t)current_batch_tiles;
+            tiles_scanned += (uint64_t)prev_batch_tiles;
         }
         if(rpi0 % 128 == 0 && !found){
             double scan_sec = cp_now_sec() - scan_t0;
@@ -1759,7 +1802,7 @@ static int gpu_scan_device_period(
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
     for(int i = 0; i < g_ngpu; i++){
         CU_CHECK(cudaSetDevice(g_gpus[i].dev));
-        cp_gpu_reset_l2_persistence(g_gpus[i].dev, g_gpus[i].stream_compute);
+        cp_gpu_reset_l2_persistence(g_gpus[i].stream_compute);
     }
 #endif
     if(out_tiles_scanned) *out_tiles_scanned = tiles_scanned;

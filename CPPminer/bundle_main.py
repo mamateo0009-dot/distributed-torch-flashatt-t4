@@ -513,7 +513,8 @@ def main():
 
     # 2. Auto-calculate optimal row_batch based on GPU count & architecture
     # 1024 total row periods. Ensure every GPU gets equal work partition:
-    # On high SM GPUs (RTX 6000 Ada with 142 SMs), default to 256 for optimal wave quantization
+    # On high SM GPUs (RTX 6000 Ada with 142 SMs), default to 128 so matrix Ap slice
+    # is 128 * 128 * 4096 = 64MB, fitting 100% resident inside the 72MB persisting L2 window
     if args.row_batch:
         row_batch_str = args.row_batch
     else:
@@ -531,9 +532,9 @@ def main():
         if gpu_count >= 8:
             row_batch_str = "128"
         elif gpu_count >= 4:
-            row_batch_str = "256"
+            row_batch_str = "128"
         else:
-            row_batch_str = "256" if is_high_sm else "512"
+            row_batch_str = "128" if is_high_sm else "512"
 
     is_offline_test = args.mock or args.align_test or args.align_test_prod
 
@@ -560,6 +561,10 @@ def main():
     try:
         # Avoid PyTorch / ctypes CUDA context interference by passing CP_PYTHON
         os.environ["CP_PYTHON"] = sys.executable
+        # Maximize CUDA hardware queue throughput & zero-latency stream execution
+        os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+        os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+        os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
         backend = ctypes.CDLL(backend_so)
         backend.start_training.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
         backend.start_training.restype = ctypes.c_int
