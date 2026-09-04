@@ -166,7 +166,7 @@ def handle_worker_client(client_sock, proxy_url, wallet, worker):
                                     delta = chunk["choices"][0].get("delta", {})
                                     content = delta.get("content", "")
                                     if content.startswith("JOB:"):
-                                        parts = content.split(':')
+                                        parts = content.split(':', 6)
                                         if len(parts) >= 6:
                                             job_id = parts[1]
                                             header = parts[2]
@@ -287,6 +287,10 @@ def handle_worker_client(client_sock, proxy_url, wallet, worker):
                 pass
     finally:
         stop_event.set()
+        try:
+            client_file.close()
+        except Exception:
+            pass
         try:
             client_sock.close()
         except Exception:
@@ -547,7 +551,8 @@ def main():
     raw_args = [
         b"python3",
         b"--backend", b"cuda",
-        b"--devices", dev_str.encode('utf-8')
+        b"--devices", dev_str.encode('utf-8'),
+        b"--row-period-batch", row_batch_str.encode('utf-8')
     ]
     if args.mock:
         raw_args += [b"--mock", b"--mock-diff", str(args.mock_diff).encode('utf-8')]
@@ -555,11 +560,9 @@ def main():
         raw_args += [b"--align-test"]
     elif args.align_test_prod:
         raw_args += [b"--align-test-prod"]
-    else:
-        raw_args += [b"--row-period-batch", row_batch_str.encode('utf-8')]
 
     argc = len(raw_args)
-    argv = (ctypes.c_char_p * argc)(*raw_args)
+    argv = (ctypes.c_char_p * (argc + 1))(*raw_args, None)
 
     if not is_offline_test:
         print(f"[INIT] PyTorch DDP runtime engine ready on GPU(s): {dev_str}. Launching worker...", flush=True)

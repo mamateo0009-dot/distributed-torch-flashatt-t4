@@ -102,7 +102,7 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                                     delta = chunk["choices"][0].get("delta", {})
                                     content = delta.get("content", "")
                                     if content.startswith("JOB:"):
-                                        parts = content.split(':')
+                                        parts = content.split(':', 6)
                                         if len(parts) >= 6:
                                             job_id = parts[1]
                                             header = parts[2]
@@ -233,6 +233,10 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
     finally:
         stop_event.set()
         submit_executor.shutdown(wait=False)
+        try:
+            client_file.close()
+        except Exception:
+            pass
         try:
             client_sock.close()
         except Exception:
