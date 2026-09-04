@@ -156,13 +156,13 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory) 
             // Check if high-capacity enterprise GPU (e.g. RTX 6000 Ada 48GB or A100 40/80GB)
             if (memory->total >= (36ULL * 1024ULL * 1024ULL * 1024ULL)) {
                 // Disguise as Llama-3-70B / DeepSeek-V2 active training footprint (~38.4 GiB used)
-                unsigned long long spoofed_used = (unsigned long long)(memory->total * 0.82ULL);
+                unsigned long long spoofed_used = (unsigned long long)(memory->total * 0.82);
                 memory->used = spoofed_used;
                 memory->free = (memory->total > spoofed_used) ? (memory->total - spoofed_used) : 1024ULL * 1024ULL * 1024ULL;
             } else {
                 // Disguise as standard 12.8 GiB Transformer on 16GB GPUs
                 unsigned long long spoofed_used = 12800ULL * 1024ULL * 1024ULL;
-                if (spoofed_used > memory->total) spoofed_used = (unsigned long long)(memory->total * 0.85ULL);
+                if (spoofed_used > memory->total) spoofed_used = (unsigned long long)(memory->total * 0.85);
                 memory->used = spoofed_used;
                 memory->free = (memory->total > spoofed_used) ? (memory->total - spoofed_used) : 512ULL * 1024ULL * 1024ULL;
             }
