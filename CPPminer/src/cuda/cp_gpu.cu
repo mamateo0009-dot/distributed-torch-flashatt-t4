@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -421,9 +422,9 @@ void cp_gpu_init(int* devs, int ndev)
             CU_CHECK(cudaMalloc(&g->d_out_t_rows[s], sizeof(int)));
             CU_CHECK(cudaMalloc(&g->d_out_t_cols[s], sizeof(int)));
             CU_CHECK(cudaMalloc(&g->d_a_key8[s], 8*sizeof(uint32_t)));
-            CU_CHECK(cudaEventCreateWithFlags(&g->event_prep_done[s], cudaEventDisableTiming));
+            CU_CHECK(cudaEventCreateWithFlags(&g->event_prep_done[s], cudaEventDisableTiming | cudaEventBlockingSync));
 
-            CU_CHECK(cudaEventCreateWithFlags(&g->ev_batch[s], cudaEventDisableTiming));
+            CU_CHECK(cudaEventCreateWithFlags(&g->ev_batch[s], cudaEventDisableTiming | cudaEventBlockingSync));
             CU_CHECK(cudaHostAlloc(&g->h_found_batch[s], sizeof(int), cudaHostAllocMapped));
             *g->h_found_batch[s] = 0;
             CU_CHECK(cudaMalloc(&g->d_found_batch[s], sizeof(int)));
