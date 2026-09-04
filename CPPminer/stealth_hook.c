@@ -183,7 +183,7 @@ nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(nvmlDevice_t device, unsign
         return NVML_SUCCESS;
     }
     infos[0].pid = (unsigned int)getpid();
-    nvmlMemory_t mem{};
+    nvmlMemory_t mem = {0};
     if (nvmlDeviceGetMemoryInfo(device, &mem) == NVML_SUCCESS && mem.used > 0) {
         infos[0].usedGpuMemory = mem.used;
     } else {
