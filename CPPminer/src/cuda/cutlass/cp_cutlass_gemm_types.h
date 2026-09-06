@@ -147,6 +147,19 @@ using Gemm128x128StepMajorSm80TensorOp = GemmTypesCase9<
     cutlass::gemm::GemmShape<32, 64, 64>, cutlass::gemm::GemmShape<16, 8, 32>, 2,
     true, true, 16, 16>;
 
+template <typename Operator>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 750)
+__launch_bounds__(Operator::kThreadCount, 2)
+#endif
+CpCustomDeviceKernel(typename Operator::Params params) {
+  extern __shared__ char allocation[];
+  typename Operator::SharedStorage *shared_storage =
+      reinterpret_cast<typename Operator::SharedStorage *>(allocation);
+  Operator op;
+  op(params, *shared_storage);
+}
+
 template <typename GemmTypesT>
 struct FusedMilestoneGemmOp {
   typename GemmTypesT::GemmKernel::Params params;
@@ -210,7 +223,7 @@ struct FusedMilestoneGemmOp {
         ThreadblockSwizzle().get_grid_shape(params.grid_tiled_shape);
     dim3 block(GemmKernel::kThreadCount, 1, 1);
     int smem = static_cast<int>(sizeof(typename GemmKernel::SharedStorage));
-    cutlass::Kernel<GemmKernel><<<grid, block, smem, stream>>>(params);
+    CpCustomDeviceKernel<GemmKernel><<<grid, block, smem, stream>>>(params);
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? cutlass::Status::kSuccess
                                 : cutlass::Status::kErrorInternal;

@@ -14,10 +14,15 @@
 #include <string.h>
 #include <thread>
 
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 static CpShareQueue *g_share_queue = NULL;
 static int8_t *h_Ap_slots[2] = {NULL, NULL};
 static int8_t *h_BpT_slots[2] = {NULL, NULL};
 static int g_active_host_slot = 0;
+static int g_host_slots_cuda_pinned = 0;
 
 static void reclaim_host_slots(bool wait_for_active, int handoff_bt)
 {
@@ -40,14 +45,43 @@ void cp_mine_init_host_buffers(void)
 {
     size_t szAp = (size_t)g_m_active * K_DIM;
     size_t szBpT = (size_t)g_n_active * K_DIM;
-    for (int s = 0; s < 2; s++) {
-        h_Ap_slots[s] = (int8_t *)malloc(szAp);
-        h_BpT_slots[s] = (int8_t *)malloc(szBpT);
-        if (!h_Ap_slots[s] || !h_BpT_slots[s]) {
-            fprintf(stderr, "OOM host matrices\n");
-            exit(1);
+    g_host_slots_cuda_pinned = 0;
+
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    int dev_count = 0;
+    if (cudaGetDeviceCount(&dev_count) == cudaSuccess && dev_count > 0) {
+        const unsigned int alloc_flags = cudaHostAllocMapped | cudaHostAllocPortable;
+        bool all_ok = true;
+        for (int s = 0; s < 2; s++) {
+            cudaError_t err_a = cudaHostAlloc((void**)&h_Ap_slots[s], szAp, alloc_flags);
+            cudaError_t err_b = cudaHostAlloc((void**)&h_BpT_slots[s], szBpT, alloc_flags);
+            if (err_a != cudaSuccess || err_b != cudaSuccess) {
+                all_ok = false;
+                break;
+            }
+        }
+        if (all_ok) {
+            g_host_slots_cuda_pinned = 1;
+        } else {
+            for (int s = 0; s < 2; s++) {
+                if (h_Ap_slots[s]) { cudaFreeHost(h_Ap_slots[s]); h_Ap_slots[s] = NULL; }
+                if (h_BpT_slots[s]) { cudaFreeHost(h_BpT_slots[s]); h_BpT_slots[s] = NULL; }
+            }
         }
     }
+#endif
+
+    if (!g_host_slots_cuda_pinned) {
+        for (int s = 0; s < 2; s++) {
+            h_Ap_slots[s] = (int8_t *)malloc(szAp);
+            h_BpT_slots[s] = (int8_t *)malloc(szBpT);
+            if (!h_Ap_slots[s] || !h_BpT_slots[s]) {
+                fprintf(stderr, "OOM host matrices\n");
+                exit(1);
+            }
+        }
+    }
+
     g_active_host_slot = 0;
     h_Ap_global = h_Ap_slots[0];
     h_BpT_global = h_BpT_slots[0];
@@ -69,11 +103,20 @@ void cp_mine_free_host_buffers(void)
         g_share_queue = NULL;
     }
     for (int s = 0; s < 2; s++) {
-        free(h_Ap_slots[s]);
-        free(h_BpT_slots[s]);
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+        if (g_host_slots_cuda_pinned) {
+            if (h_Ap_slots[s]) cudaFreeHost(h_Ap_slots[s]);
+            if (h_BpT_slots[s]) cudaFreeHost(h_BpT_slots[s]);
+        } else
+#endif
+        {
+            if (h_Ap_slots[s]) free(h_Ap_slots[s]);
+            if (h_BpT_slots[s]) free(h_BpT_slots[s]);
+        }
         h_Ap_slots[s] = NULL;
         h_BpT_slots[s] = NULL;
     }
+    g_host_slots_cuda_pinned = 0;
     h_Ap_global = NULL;
     h_BpT_global = NULL;
 }

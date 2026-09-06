@@ -68,9 +68,14 @@ __device__ __forceinline__ uint32_t cp_cutlass_reduce_accum64_lop3(const AccumAr
 __device__ __forceinline__ void cp_cutlass_jackpot_fold_step(
     uint32_t* jackpot_words, int step, uint32_t partial_xor)
 {
-    const int tid = step % CP_CUTLASS_JACKPOT_WORDS;
-    jackpot_words[tid] =
-        cp_cutlass_rotl32(jackpot_words[tid], CP_CUTLASS_JACKPOT_LROT) ^ partial_xor;
+    const int tid = step & (CP_CUTLASS_JACKPOT_WORDS - 1);
+    #pragma unroll
+    for (int i = 0; i < CP_CUTLASS_JACKPOT_WORDS; ++i) {
+        if (i == tid) {
+            jackpot_words[i] =
+                cp_cutlass_rotl32(jackpot_words[i], CP_CUTLASS_JACKPOT_LROT) ^ partial_xor;
+        }
+    }
 }
 
 __device__ __forceinline__ bool cp_cutlass_jackpot_target_ok(
@@ -126,7 +131,7 @@ __device__ __forceinline__ void cp_cutlass_tile_origin(
 }
 
 template <typename TileType = CutlassJackpotTile>
-__device__ __forceinline__ void cp_cutlass_jackpot_try(
+__device__ __noinline__ void cp_cutlass_jackpot_try(
     const uint32_t jackpot_words[CP_CUTLASS_JACKPOT_WORDS],
     const uint32_t* a_key8,
     const uint32_t bound[8],
@@ -137,12 +142,8 @@ __device__ __forceinline__ void cp_cutlass_jackpot_try(
     int* out_t_rows,
     int* out_t_cols)
 {
-    uint32_t msg[CP_CUTLASS_JACKPOT_WORDS];
-    for(int i = 0; i < CP_CUTLASS_JACKPOT_WORDS; i++)
-        msg[i] = jackpot_words[i];
-
     uint32_t digest[8];
-    b3_compress64(a_key8, msg, digest);
+    b3_compress64(a_key8, jackpot_words, digest);
 
     if(!cp_cutlass_jackpot_target_ok(digest, bound))
         return;

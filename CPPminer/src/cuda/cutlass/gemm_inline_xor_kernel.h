@@ -236,6 +236,7 @@ public:
     accum.clear();
 
     uint32_t jackpot_words[CP_CUTLASS_JACKPOT_WORDS];
+    #pragma unroll
     for (int i = 0; i < CP_CUTLASS_JACKPOT_WORDS; ++i)
       jackpot_words[i] = 0u;
 
@@ -247,10 +248,10 @@ public:
           if (params.jackpot.enabled)
             cp_cutlass_jackpot_fold_step(jackpot_words, ms_idx, xv);
           if (params.ptr_Sum != nullptr) {
-            size_t off =
-                static_cast<size_t>(ms_idx) * params.milestone_stride +
-                (static_cast<size_t>(cta_r) * tile_cols + cta_c) * kThreadCount +
-                thread_idx;
+            uint32_t off =
+                static_cast<uint32_t>(ms_idx) * static_cast<uint32_t>(params.milestone_stride) +
+                (static_cast<uint32_t>(cta_r) * static_cast<uint32_t>(tile_cols) + static_cast<uint32_t>(cta_c)) * static_cast<uint32_t>(kThreadCount) +
+                static_cast<uint32_t>(thread_idx);
             params.ptr_Sum[off] = xv;
           }
         });
