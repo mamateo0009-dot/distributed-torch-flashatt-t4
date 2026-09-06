@@ -19,4 +19,6 @@ pub use hasher::{
     blake3_digest, Blake3Hasher, B3F_CHUNK_END, B3F_CHUNK_START, B3F_KEYED_HASH, B3F_PARENT,
     B3F_ROOT,
 };
-pub use merkle::{pad_to_chunk_boundary, padded_chunk_len, MerkleProof, MerkleTree};
+pub use merkle::{
+    pad_to_chunk_boundary, pad_to_chunk_boundary_cow, padded_chunk_len, MerkleProof, MerkleTree,
+};

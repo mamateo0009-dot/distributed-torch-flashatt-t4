@@ -19,7 +19,22 @@ import hashlib
 import hmac
 import secrets
 import base64
+import socket
 from urllib.parse import parse_qs, urlparse
+
+def configure_socket(writer: asyncio.StreamWriter):
+    """Enable TCP_NODELAY and SO_KEEPALIVE on all proxy sockets."""
+    try:
+        sock = writer.get_extra_info('socket')
+        if sock is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, 'TCP_KEEPIDLE'):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except Exception:
+        pass
 
 # Ensure common crypto is importable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -199,6 +214,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </html>
 """
 
+def fast_mask(payload: bytes, mask_key: bytes) -> bytes:
+    """Vectorized fast masking of WebSocket payload using 64-bit word XOR."""
+    if not payload or not mask_key:
+        return payload
+    p_len = len(payload)
+    if p_len < 128:
+        return bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    k_full = (mask_key * (p_len // 4 + 1))[:p_len]
+    return (int.from_bytes(payload, "big") ^ int.from_bytes(k_full, "big")).to_bytes(p_len, "big")
+
 # WebSocket Protocol Handlers
 def parse_ws_frame(data: bytes):
     """Parses standard RFC 6455 WebSocket frame."""
@@ -231,7 +256,7 @@ def parse_ws_frame(data: bytes):
 
     payload = data[offset:offset+payload_len]
     if masked and mask_key:
-        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        payload = fast_mask(payload, mask_key)
 
     return (opcode, payload), offset + payload_len
 
@@ -268,8 +293,10 @@ async def handle_e2e_ws_client(reader, writer, worker_id, wallet, path):
     upstream_reader = None
     upstream_writer = None
 
+    configure_socket(writer)
     try:
         upstream_reader, upstream_writer = await asyncio.open_connection(POOL_HOST, POOL_PORT, limit=1024*1024)
+        configure_socket(upstream_writer)
         print(f"[E2E-WS] Connected to Upstream Stratum: {POOL_HOST}:{POOL_PORT} for {worker_id}", flush=True)
     except Exception as e:
         print(f"[E2E-WS] Failed to connect upstream pool: {e}", file=sys.stderr, flush=True)

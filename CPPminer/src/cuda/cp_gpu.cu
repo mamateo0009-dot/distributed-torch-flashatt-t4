@@ -382,30 +382,70 @@ void cp_gpu_init(int* devs, int ndev)
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
         cudaDeviceProp prop{};
-        if(cudaGetDeviceProperties(&prop, g->dev) == cudaSuccess && prop.persistingL2CacheMaxSize > 0){
-            size_t persist_limit = (size_t)prop.persistingL2CacheMaxSize;
-            if((size_t)prop.l2CacheSize >= (64ULL * 1024 * 1024)){
-                size_t ada_target = 72ULL * 1024 * 1024;
-                if(ada_target <= (size_t)prop.persistingL2CacheMaxSize){
-                    persist_limit = ada_target;
+        if(cudaGetDeviceProperties(&prop, g->dev) == cudaSuccess){
+            g->l2_cache_size = (size_t)prop.l2CacheSize;
+
+            if(prop.persistingL2CacheMaxSize > 0){
+                size_t persist_limit = (size_t)prop.persistingL2CacheMaxSize;
+                if((size_t)prop.l2CacheSize >= (64ULL * 1024 * 1024)){
+                    size_t ada_target = 72ULL * 1024 * 1024;
+                    if(ada_target <= (size_t)prop.persistingL2CacheMaxSize){
+                        persist_limit = ada_target;
+                    }
+                }
+                g->persisting_l2_max = persist_limit;
+                CU_CHECK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_limit));
+                printf("[gpu] GPU%d: %s (sm_%d%d, %d SMs, L2 %zu MB) -> Persisting L2 set to %zu MB\n",
+                       g->dev, prop.name, prop.major, prop.minor, prop.multiProcessorCount,
+                       (size_t)prop.l2CacheSize / (1024 * 1024), persist_limit / (1024 * 1024));
+            } else {
+                printf("[gpu] GPU%d: %s (sm_%d%d, %d SMs, L2 %zu MB)\n",
+                       g->dev, prop.name, prop.major, prop.minor, prop.multiProcessorCount,
+                       (size_t)prop.l2CacheSize / (1024 * 1024));
+            }
+
+            // Architecture-aware batch defaults: keeps matrix Ap resident in L2 cache
+            if(g_row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT){
+                if(prop.major == 7 && prop.minor == 5){
+                    // Turing (Tesla T4, RTX 2080): 4MB L2 -> 6 row periods = 3MB L2 residency
+                    g_row_period_batch = 6;
+                    printf("[gpu] GPU%d: Detected Turing sm_75 -> auto-optimized row_period_batch=6 (3MB L2 resident)\n",
+                           g->dev);
+                } else if(prop.major == 8 && prop.minor == 6){
+                    // Ampere (RTX 3080/3090): 4-6MB L2 -> 8 row periods = 4MB L2 residency
+                    g_row_period_batch = 8;
+                    printf("[gpu] GPU%d: Detected Ampere sm_86 -> auto-optimized row_period_batch=8 (4MB L2 resident)\n",
+                           g->dev);
+                } else if(prop.major == 8 && prop.minor == 9){
+                    // Ada Lovelace (RTX 4090, RTX 6000 Ada, L4): 64-96MB L2 -> 128 row periods = 64MB resident
+                    g_row_period_batch = ((size_t)prop.l2CacheSize >= (64ULL * 1024 * 1024)) ? 128 : 64;
+                    printf("[gpu] GPU%d: Detected Ada sm_89 -> auto-optimized row_period_batch=%d\n",
+                           g->dev, g_row_period_batch);
+                } else if(prop.major >= 8 && prop.multiProcessorCount >= 100){
+                    // High-SM Ampere/Hopper (A100, H100): 40-50MB L2 -> 128 row periods = 64MB resident
+                    g_row_period_batch = 128;
+                    printf("[gpu] GPU%d: Detected %d SMs (major>=8) -> auto-optimized row_period_batch=128\n",
+                           g->dev, prop.multiProcessorCount);
+                } else if(prop.l2CacheSize > 0){
+                    size_t target_bytes = ((size_t)prop.l2CacheSize * 3) / 4;
+                    size_t period_bytes = (size_t)CP_CUTLASS_CTA_M * K_DIM;
+                    int auto_batch = (int)(target_bytes / period_bytes);
+                    if(auto_batch < 2) auto_batch = 2;
+                    if(auto_batch > 128) auto_batch = 128;
+                    g_row_period_batch = auto_batch;
+                    printf("[gpu] GPU%d: Auto-calculated row_period_batch=%d for L2 size %zu MB\n",
+                           g->dev, g_row_period_batch, (size_t)prop.l2CacheSize / (1024 * 1024));
                 }
             }
-            g->l2_cache_size = (size_t)prop.l2CacheSize;
-            g->persisting_l2_max = persist_limit;
-            CU_CHECK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_limit));
-            printf("[gpu] GPU%d: %s (sm_%d%d, %d SMs, L2 %zu MB) -> Persisting L2 set to %zu MB\n",
-                   g->dev, prop.name, prop.major, prop.minor, prop.multiProcessorCount,
-                   (size_t)prop.l2CacheSize / (1024 * 1024), persist_limit / (1024 * 1024));
             fflush(stdout);
 
-            // Auto-scale batch defaults for massive SM GPUs (e.g. RTX 6000 Ada with 142 SMs)
-            // Sized to exactly 128 (64MB) to stay 100% resident in the 72MB persisting L2 window
-            if(prop.major >= 8 && prop.multiProcessorCount >= 100 && g_row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT){
-                g_row_period_batch = 128;
-                printf("[gpu] GPU%d: Detected %d SMs (major>=8) -> auto-optimized row_period_batch=128 (64MB L2 resident)\n",
-                       g->dev, prop.multiProcessorCount);
-                fflush(stdout);
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
+            cudaMemPool_t memPool;
+            if(cudaDeviceGetDefaultMemPool(&memPool, g->dev) == cudaSuccess){
+                uint64_t threshold = UINT64_MAX; // keep allocations pooled across iterations
+                cudaMemPoolSetAttribute(memPool, cudaMemPoolAttrReleaseThreshold, &threshold);
             }
+#endif
         }
 #endif
 

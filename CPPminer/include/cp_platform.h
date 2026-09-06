@@ -11,6 +11,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #include <windows.h>
 
 #ifdef _MSC_VER
@@ -39,6 +40,7 @@ static inline void cp_sleep(unsigned seconds) {
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 

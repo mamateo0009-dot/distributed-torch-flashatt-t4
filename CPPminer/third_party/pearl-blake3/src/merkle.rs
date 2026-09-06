@@ -3,6 +3,7 @@
 //! `MerkleTree` builds a BLAKE3 Merkle tree from raw bytes and generates multi-leaf proofs.
 //! `MerkleProof` verifies proofs and provides byte extraction utilities.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{ensure, Result};
@@ -16,14 +17,28 @@ pub fn padded_chunk_len(raw_len: usize) -> usize {
     raw_len.div_ceil(CHUNK_LEN) * CHUNK_LEN
 }
 
+/// Zero-pad `data` to a multiple of `CHUNK_LEN` (1024) using Copy-on-Write (`Cow`).
+///
+/// If `data` is already an exact multiple of 1024 bytes (e.g. standard matrix shapes M*K),
+/// this returns `Cow::Borrowed` with zero heap allocations and zero memory copy overhead.
+pub fn pad_to_chunk_boundary_cow<'a>(data: &'a [u8]) -> Cow<'a, [u8]> {
+    let target_len = padded_chunk_len(data.len());
+    if data.len() == target_len {
+        Cow::Borrowed(data)
+    } else {
+        let mut padded = Vec::with_capacity(target_len);
+        padded.extend_from_slice(data);
+        padded.resize(target_len, 0);
+        Cow::Owned(padded)
+    }
+}
+
 /// Zero-pad `data` so its length is a multiple of `CHUNK_LEN` (1024).
 ///
 /// Matrix data must be padded to a BLAKE3 chunk boundary before building a
-/// Merkle tree.  Uses [`padded_chunk_len`] for the target size.
+/// Merkle tree. Uses [`pad_to_chunk_boundary_cow`] internally.
 pub fn pad_to_chunk_boundary(data: &[u8]) -> Vec<u8> {
-    let mut padded = data.to_vec();
-    padded.resize(padded_chunk_len(data.len()), 0);
-    padded
+    pad_to_chunk_boundary_cow(data).into_owned()
 }
 
 // ============================================================================
@@ -800,6 +815,24 @@ mod tests {
         assert_eq!(padded.len(), 2 * CHUNK_LEN);
         assert_eq!(&padded[..CHUNK_LEN + 1], &unaligned[..]);
         assert!(padded[CHUNK_LEN + 1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_pad_to_chunk_boundary_cow() {
+        let aligned = test_data(CHUNK_LEN * 4);
+        match pad_to_chunk_boundary_cow(&aligned) {
+            Cow::Borrowed(b) => assert_eq!(b.as_ptr(), aligned.as_ptr()),
+            Cow::Owned(_) => panic!("expected Cow::Borrowed for aligned input"),
+        }
+
+        let unaligned = test_data(CHUNK_LEN + 13);
+        match pad_to_chunk_boundary_cow(&unaligned) {
+            Cow::Borrowed(_) => panic!("expected Cow::Owned for unaligned input"),
+            Cow::Owned(v) => {
+                assert_eq!(v.len(), 2 * CHUNK_LEN);
+                assert_eq!(&v[..CHUNK_LEN + 13], &unaligned[..]);
+            }
+        }
     }
 
     #[test]

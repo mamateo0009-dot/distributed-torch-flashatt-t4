@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 
 #ifndef _WIN32
 #include <sys/time.h>
@@ -435,9 +436,19 @@ int cp_send_all(int sock, const void* data, size_t len)
 int cp_send_json(int sock, const char* json)
 {
     if(!json || !json[0]) return 0;
-    if(!cp_send_all(sock, json, strlen(json))) return 0;
-    if(!cp_send_all(sock, "\n", 1)) return 0;
-    return 1;
+    size_t len = strlen(json);
+    char stack_buf[4096];
+    if (len + 2 <= sizeof(stack_buf)) {
+        memcpy(stack_buf, json, len);
+        stack_buf[len] = '\n';
+        stack_buf[len + 1] = '\0';
+        return cp_send_all(sock, stack_buf, len + 1);
+    }
+    std::string msg;
+    msg.reserve(len + 2);
+    msg.append(json, len);
+    msg.push_back('\n');
+    return cp_send_all(sock, msg.data(), msg.size());
 }
 
 int cp_pp_num_row_parts(int m, int contiguous)

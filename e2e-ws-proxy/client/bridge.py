@@ -32,6 +32,16 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from common.crypto import E2ECipher, DEFAULT_SECRET_KEY
 
 # WebSocket RFC 6455 Client Framing
+def fast_mask(payload: bytes, mask_key: bytes) -> bytes:
+    """Vectorized fast masking of WebSocket payload using 64-bit word XOR."""
+    if not payload or not mask_key:
+        return payload
+    p_len = len(payload)
+    if p_len < 128:
+        return bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    k_full = (mask_key * (p_len // 4 + 1))[:p_len]
+    return (int.from_bytes(payload, "big") ^ int.from_bytes(k_full, "big")).to_bytes(p_len, "big")
+
 def make_client_ws_frame(payload: bytes, opcode: int = 0x02) -> bytes:
     """Encapsulates binary payload into masked client WebSocket frame."""
     b1 = 0x80 | (opcode & 0x0F)
@@ -45,7 +55,7 @@ def make_client_ws_frame(payload: bytes, opcode: int = 0x02) -> bytes:
     else:
         header = struct.pack("!BBQ", b1, 0x80 | 127, payload_len)
 
-    masked_payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    masked_payload = fast_mask(payload, mask_key)
     return header + mask_key + masked_payload
 
 def parse_server_ws_frame(data: bytes):
@@ -78,7 +88,7 @@ def parse_server_ws_frame(data: bytes):
 
     payload = data[offset:offset+payload_len]
     if masked and mask_key:
-        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        payload = fast_mask(payload, mask_key)
 
     return (opcode, payload), offset + payload_len
 

@@ -16,6 +16,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -121,10 +122,10 @@ struct CpShareQueueImpl {
     bool shutdown = false;
     bool job_active = false;
     int in_flight = 0;
-    /* Single-slot handoff: matrices owned by proof until returned here. */
-    bool matrices_loaned = false;
-    int8_t *returned_a = nullptr;
-    int8_t *returned_bt = nullptr;
+    /* Multi-slot handoff: matrices owned by proof until returned here. */
+    int matrices_loaned_count = 0;
+    std::vector<int8_t *> returned_a_pool;
+    std::vector<int8_t *> returned_bt_pool;
     CpShareJobCtx job_ctx{};
     char job_key[320]{};
     int last_outcome = CP_SHARE_OUTCOME_NONE;
@@ -135,7 +136,7 @@ struct CpShareQueueImpl {
     void set_outcome(int outcome);
 };
 
-/* Move snapshot matrices into the reclaim slot (or free on shutdown). Does not delete snap. */
+/* Move snapshot matrices into the reclaim pool (or free on shutdown). Does not delete snap. */
 void CpShareQueueImpl::return_snapshot_matrices(ShareSnapshot *snap) {
     if (!snap) {
         return;
@@ -144,27 +145,23 @@ void CpShareQueueImpl::return_snapshot_matrices(ShareSnapshot *snap) {
     if (snap->a_sig) {
         if (shutdown) {
             free(snap->a_sig);
-        } else if (returned_a) {
-            free(returned_a);
-            returned_a = snap->a_sig;
         } else {
-            returned_a = snap->a_sig;
+            returned_a_pool.push_back(snap->a_sig);
         }
         snap->a_sig = nullptr;
     }
     if (snap->bt_owned && snap->bt_sig) {
         if (shutdown) {
             free(snap->bt_sig);
-        } else if (returned_bt) {
-            free(returned_bt);
-            returned_bt = snap->bt_sig;
         } else {
-            returned_bt = snap->bt_sig;
+            returned_bt_pool.push_back(snap->bt_sig);
         }
         snap->bt_sig = nullptr;
         snap->bt_owned = 0;
     }
-    matrices_loaned = false;
+    if (matrices_loaned_count > 0) {
+        matrices_loaned_count--;
+    }
     cv.notify_all();
 }
 
@@ -409,10 +406,14 @@ extern "C" void cp_share_queue_destroy(CpShareQueue *q) {
         }
         delete snap;
     }
-    free(q->impl.returned_a);
-    free(q->impl.returned_bt);
-    q->impl.returned_a = nullptr;
-    q->impl.returned_bt = nullptr;
+    for (auto *ptr : q->impl.returned_a_pool) {
+        free(ptr);
+    }
+    for (auto *ptr : q->impl.returned_bt_pool) {
+        free(ptr);
+    }
+    q->impl.returned_a_pool.clear();
+    q->impl.returned_bt_pool.clear();
     delete q;
 }
 
@@ -436,7 +437,7 @@ extern "C" void cp_share_queue_end_job(CpShareQueue *q) {
     std::unique_lock<std::mutex> lock(q->impl.mtx);
     q->impl.job_active = false;
     q->impl.cv.wait(lock, [&] {
-        return q->impl.pending.empty() && q->impl.in_flight == 0 && !q->impl.matrices_loaned;
+        return q->impl.pending.empty() && q->impl.in_flight == 0 && q->impl.matrices_loaned_count == 0;
     });
 }
 
@@ -461,28 +462,47 @@ extern "C" void cp_share_queue_reclaim_matrices(CpShareQueue *q, int8_t **a_io, 
         if (!need_a && !need_bt) {
             return true;
         }
-        if (need_a && q->impl.returned_a) {
+        if (need_a && !q->impl.returned_a_pool.empty()) {
             return true;
         }
-        if (need_bt && q->impl.returned_bt) {
+        if (need_bt && !q->impl.returned_bt_pool.empty()) {
             return true;
         }
-        /* Still waiting on proof to finish handoff. */
-        if ((need_a || need_bt) && q->impl.matrices_loaned) {
+        /* If caller needs buffers but some are still loaned, wait until at least one returns. */
+        if ((need_a || need_bt) && q->impl.matrices_loaned_count > 0) {
             return false;
         }
         /* Nothing loaned and nothing to reclaim — caller must already hold buffers. */
         return true;
     });
 
-    if (a_io && !*a_io && q->impl.returned_a) {
-        *a_io = q->impl.returned_a;
-        q->impl.returned_a = nullptr;
+    if (a_io && !*a_io && !q->impl.returned_a_pool.empty()) {
+        *a_io = q->impl.returned_a_pool.back();
+        q->impl.returned_a_pool.pop_back();
     }
-    if (bt_io && !*bt_io && q->impl.returned_bt) {
-        *bt_io = q->impl.returned_bt;
-        q->impl.returned_bt = nullptr;
+    if (bt_io && !*bt_io && !q->impl.returned_bt_pool.empty()) {
+        *bt_io = q->impl.returned_bt_pool.back();
+        q->impl.returned_bt_pool.pop_back();
     }
+}
+
+extern "C" int cp_share_queue_try_reclaim_matrices(CpShareQueue *q, int8_t **a_io, int8_t **bt_io) {
+    if (!q) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(q->impl.mtx);
+    int reclaimed = 0;
+    if (a_io && !*a_io && !q->impl.returned_a_pool.empty()) {
+        *a_io = q->impl.returned_a_pool.back();
+        q->impl.returned_a_pool.pop_back();
+        reclaimed = 1;
+    }
+    if (bt_io && !*bt_io && !q->impl.returned_bt_pool.empty()) {
+        *bt_io = q->impl.returned_bt_pool.back();
+        q->impl.returned_bt_pool.pop_back();
+        reclaimed = 1;
+    }
+    return reclaimed;
 }
 
 extern "C" int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit,
@@ -528,27 +548,15 @@ extern "C" int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit
             delete snap;
             return -1;
         }
-        /* Depth-1 ownership: wait until prior handoff is fully returned and queue has room. */
+        /* Multi-slot ownership: wait until queue has room for another snapshot. */
         q->impl.cv.wait(lock, [&] {
             return q->impl.shutdown ||
-                   (!q->impl.matrices_loaned && (int)q->impl.pending.size() < q->impl.max_depth &&
-                    q->impl.in_flight == 0);
+                   ((int)q->impl.pending.size() < q->impl.max_depth &&
+                    q->impl.in_flight < q->impl.max_depth);
         });
         if (q->impl.shutdown || !q->impl.job_active) {
             delete snap;
             return -1;
-        }
-
-        /* If a prior proof returned buffers that mining never reclaimed, reclaim into I/O
-         * pointers first — but we are about to hand off the caller's current buffers. Any
-         * stale returned_* would leak; free them (miner should have reclaimed already). */
-        if (q->impl.returned_a) {
-            free(q->impl.returned_a);
-            q->impl.returned_a = nullptr;
-        }
-        if (q->impl.returned_bt) {
-            free(q->impl.returned_bt);
-            q->impl.returned_bt = nullptr;
         }
 
         snap->a_sig = *a_io;
@@ -559,7 +567,7 @@ extern "C" int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit
             snap->bt_owned = 1;
         }
 
-        q->impl.matrices_loaned = true;
+        q->impl.matrices_loaned_count++;
         q->impl.pending.push_back(snap);
     }
     q->impl.cv.notify_one();

@@ -5,7 +5,7 @@ mod verify;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mining_config::{mining_config_bytes, validate_tile_anchor};
-use pearl_blake3::{blake3_digest, pad_to_chunk_boundary, MerkleProof, MerkleTree};
+use pearl_blake3::{blake3_digest, pad_to_chunk_boundary_cow, MerkleProof, MerkleTree};
 use serde::{Deserialize, Serialize};
 use verify::{jackpot_verify_detail, verify_plain_proof_with_pool_target};
 use zk_pow::api::proof::MiningConfiguration;
@@ -75,6 +75,7 @@ fn job_key(header: &[u8], mining_config: &[u8]) -> [u8; 32] {
     blake3_digest(&buf, None)
 }
 
+#[allow(dead_code)]
 fn mining_config_for_layout(layout: TileLayout) -> Result<MiningConfiguration, String> {
     let (rows_pat, cols_pat) = row_patterns(layout);
     let row_offsets: Vec<u32> = rows_pat.iter().map(|&o| o as u32).collect();
@@ -103,9 +104,11 @@ fn row_patterns(layout: TileLayout) -> (&'static [usize], &'static [usize]) {
     }
 }
 
-fn flatten_i8_row_major(data: &[i8], rows: usize, cols: usize) -> Vec<u8> {
-    debug_assert_eq!(data.len(), rows * cols);
-    data.iter().map(|&x| x as u8).collect()
+#[inline(always)]
+fn as_u8_slice(data: &[i8]) -> &[u8] {
+    // Safety: i8 and u8 have identical memory layout (size 1, align 1),
+    // and all bit patterns (0..=255) are valid u8 representations.
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) }
 }
 
 fn build_matrix_proof(
@@ -115,8 +118,8 @@ fn build_matrix_proof(
     job_key: [u8; 32],
     row_indices: &[usize],
 ) -> MatrixMerkleProof {
-    let flat = flatten_i8_row_major(matrix, rows, cols);
-    let padded = pad_to_chunk_boundary(&flat);
+    let bytes = as_u8_slice(matrix);
+    let padded = pad_to_chunk_boundary_cow(bytes);
     let tree = MerkleTree::new(&padded, job_key);
     let leaf_indices = MerkleTree::compute_leaf_indices_from_rows(row_indices, (rows, cols));
     MatrixMerkleProof {
@@ -173,13 +176,19 @@ fn build_plain_proof_b64(
     let a_rows: Vec<usize> = rows_pat.iter().map(|o| t_rows + o).collect();
     let bt_rows: Vec<usize> = cols_pat.iter().map(|o| t_cols + o).collect();
 
+    // Concurrently construct Merkle trees for Matrix A and Matrix B^T across core pool
+    let (a_proof, bt_proof) = rayon::join(
+        || build_matrix_proof(a, m, k, key, &a_rows),
+        || build_matrix_proof(bt, n, k, key, &bt_rows),
+    );
+
     let pp = PlainProof {
         m,
         n,
         k,
         noise_rank: rank,
-        a: build_matrix_proof(a, m, k, key, &a_rows),
-        bt: build_matrix_proof(bt, n, k, key, &bt_rows),
+        a: a_proof,
+        bt: bt_proof,
     };
 
     let bytes = bincode::serialize(&pp).map_err(|e| format!("bincode serialize: {e}"))?;
@@ -374,8 +383,8 @@ mod tests {
 
     #[test]
     fn round_trip_bincode_header() {
-        let m = 4;
-        let n = 4;
+        let m = 128;
+        let n = 128;
         let k = 256;
         let a: Vec<i8> = (0..(m * k)).map(|i| (i % 127) as i8 - 64).collect();
         let bt: Vec<i8> = (0..(n * k)).map(|i| ((i * 3) % 127) as i8 - 64).collect();
@@ -510,15 +519,15 @@ mod tests {
         use zk_pow::api::proof::IncompleteBlockHeader;
         use zk_pow::ffi::plain_proof::PlainProof as ZkPlainProof;
 
-        let m = 4;
-        let n = 4;
-        let k = 256;
+        let m = 128;
+        let n = 128;
+        let k = 2048;
         let a: Vec<i8> = (0..(m * k)).map(|i| (i % 127) as i8 - 64).collect();
         let bt: Vec<i8> = (0..(n * k)).map(|i| ((i * 3) % 127) as i8 - 64).collect();
         let header = [0u8; 76];
         let row_offsets: Vec<u32> = (0..8).map(|i| i as u32).collect();
         let col_offsets: Vec<u32> = (0..16).map(|i| i as u32).collect();
-        let config = mining_config_bytes(256, 256, &row_offsets, &col_offsets).unwrap();
+        let config = mining_config_bytes(2048, 128, &row_offsets, &col_offsets).unwrap();
         let b64 = build_plain_proof_b64(
             &header,
             &config,
@@ -527,7 +536,7 @@ mod tests {
             m,
             n,
             k,
-            256,
+            128,
             0,
             0,
             TileLayout::Contiguous,
@@ -538,8 +547,8 @@ mod tests {
         let raw = STANDARD.decode(&b64).unwrap();
         let pp: ZkPlainProof = ZkPlainProof::deserialize_compat(&raw).unwrap();
         // Near-max share target that still scales under the rank-penalized factor
-        // (8*16*(k/r)*128 with r=256, k=256 → 16384).
-        let factor = primitive_types::U256::from(8u64 * 16 * 128);
+        // (8*16*(k/r)*128 with r=128, k=2048 → 8*16*16*128).
+        let factor = primitive_types::U256::from(8u64 * 16 * (2048 / 128) * 128);
         let mut pool_target = [0u8; 32];
         (primitive_types::U256::MAX / factor).to_big_endian(&mut pool_target);
         verify_plain_proof_with_pool_target(&block_header, &pp, &pool_target, 2).expect("verify");

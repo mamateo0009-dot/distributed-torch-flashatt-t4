@@ -51,6 +51,25 @@ static int tcp_connect(const char* host, int port)
         CP_SOCK_CLOSE(s);
         return (int)CP_INVALID_SOCK;
     }
+
+    int nodelay = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+    int keepalive = 1;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
+#ifdef _WIN32
+    struct tcp_keepalive kalive;
+    kalive.onoff = 1;
+    kalive.keepalivetime = 15000;    /* 15s idle probe */
+    kalive.keepaliveinterval = 3000; /* 3s probe interval */
+    DWORD ret_bytes = 0;
+    WSAIoctl(s, SIO_KEEPALIVE_VALS, &kalive, sizeof(kalive), NULL, 0, &ret_bytes, NULL, NULL);
+#elif defined(__linux__)
+    int idle = 15, intvl = 3, cnt = 3;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+
     return (int)s;
 }
 

@@ -15,20 +15,46 @@
 #include <thread>
 
 static CpShareQueue *g_share_queue = NULL;
+static int8_t *h_Ap_slots[2] = {NULL, NULL};
+static int8_t *h_BpT_slots[2] = {NULL, NULL};
+static int g_active_host_slot = 0;
+
+static void reclaim_host_slots(bool wait_for_active, int handoff_bt)
+{
+    if (!g_share_queue) return;
+    int inactive = 1 - g_active_host_slot;
+    cp_share_queue_try_reclaim_matrices(g_share_queue, &h_Ap_slots[inactive],
+                                       handoff_bt ? &h_BpT_slots[inactive] : NULL);
+    if (wait_for_active && (!h_Ap_slots[g_active_host_slot] || (handoff_bt && !h_BpT_slots[g_active_host_slot]))) {
+        cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_slots[g_active_host_slot],
+                                       handoff_bt ? &h_BpT_slots[g_active_host_slot] : NULL);
+    } else {
+        cp_share_queue_try_reclaim_matrices(g_share_queue, &h_Ap_slots[g_active_host_slot],
+                                           handoff_bt ? &h_BpT_slots[g_active_host_slot] : NULL);
+    }
+    h_Ap_global = h_Ap_slots[g_active_host_slot];
+    h_BpT_global = h_BpT_slots[g_active_host_slot];
+}
 
 void cp_mine_init_host_buffers(void)
 {
     size_t szAp = (size_t)g_m_active * K_DIM;
     size_t szBpT = (size_t)g_n_active * K_DIM;
-    h_Ap_global = (int8_t *)malloc(szAp);
-    h_BpT_global = (int8_t *)malloc(szBpT);
-    if (!h_Ap_global || !h_BpT_global) {
-        fprintf(stderr, "OOM host matrices\n");
-        exit(1);
+    for (int s = 0; s < 2; s++) {
+        h_Ap_slots[s] = (int8_t *)malloc(szAp);
+        h_BpT_slots[s] = (int8_t *)malloc(szBpT);
+        if (!h_Ap_slots[s] || !h_BpT_slots[s]) {
+            fprintf(stderr, "OOM host matrices\n");
+            exit(1);
+        }
     }
+    g_active_host_slot = 0;
+    h_Ap_global = h_Ap_slots[0];
+    h_BpT_global = h_BpT_slots[0];
+
     if (!g_share_queue) {
-        /* Depth 1: single host A/B handoff slot (no snapshot memcpy). */
-        g_share_queue = cp_share_queue_create(1);
+        /* Depth 2: dual-slot ping-pong host A/B handoff (zero-stall mining). */
+        g_share_queue = cp_share_queue_create(2);
         if (!g_share_queue) {
             fprintf(stderr, "OOM share proof queue\n");
             exit(1);
@@ -42,8 +68,12 @@ void cp_mine_free_host_buffers(void)
         cp_share_queue_destroy(g_share_queue);
         g_share_queue = NULL;
     }
-    free(h_Ap_global);
-    free(h_BpT_global);
+    for (int s = 0; s < 2; s++) {
+        free(h_Ap_slots[s]);
+        free(h_BpT_slots[s]);
+        h_Ap_slots[s] = NULL;
+        h_BpT_slots[s] = NULL;
+    }
     h_Ap_global = NULL;
     h_BpT_global = NULL;
 }
@@ -190,10 +220,9 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 
         /* Reclaim host matrices when this attempt will write them (CPU / host-gen).
          * GPU prep defers reclaim until a share hit so scanning can continue while
-         * proof holds the single A buffer. */
+         * proof holds the previous buffer. */
         if (g_share_queue && !defer_host_reclaim) {
-            cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_global,
-                                           handoff_bt ? &h_BpT_global : NULL);
+            reclaim_host_slots(true, handoff_bt);
             if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
                 fprintf(stderr, "[ERROR] Host tensor memory unavailable after reclaim\n");
                 rc = CP_JOB_NONE;
@@ -326,10 +355,9 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             const uint64_t tiles_since_prev = tiles_scanned_total - tiles_at_prev_share;
 
             if (g_share_queue) {
-                cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_global,
-                                               handoff_bt ? &h_BpT_global : NULL);
+                reclaim_host_slots(true, handoff_bt);
             }
-            if (!h_Ap_global || (handoff_bt && !h_BpT_global)) {
+            if (!h_Ap_slots[g_active_host_slot] || (handoff_bt && !h_BpT_slots[g_active_host_slot])) {
                 fprintf(stderr, "[plain] host matrix buffers missing before proof handoff\n");
                 cp_fee_note_tiles(scan_tiles);
                 nonce++;
@@ -337,7 +365,7 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
             }
             if (defer_host_reclaim) {
                 if (cp_worker_fetch_share_signals(
-                            h_Ap_global, handoff_bt ? h_BpT_global : NULL) != 0) {
+                            h_Ap_slots[g_active_host_slot], handoff_bt ? h_BpT_slots[g_active_host_slot] : NULL) != 0) {
                     fprintf(stderr, "[plain] failed to fetch signal matrices nonce=%llu\n",
                             (unsigned long long)nonce);
                     cp_fee_note_tiles(scan_tiles);
@@ -352,12 +380,17 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
                                     interval_sec,
                                     handoff_bt};
             if (cp_share_queue_enqueue_hit(g_share_queue, &hit, header, hlen, job_id, target_hex,
-                                           &h_Ap_global, szAp, &h_BpT_global, szBpT) != 0) {
+                                           &h_Ap_slots[g_active_host_slot], szAp,
+                                           handoff_bt ? &h_BpT_slots[g_active_host_slot] : NULL, szBpT) != 0) {
                 fprintf(stderr, "[plain] failed to enqueue share nonce=%llu\n",
                         (unsigned long long)nonce);
             } else {
                 tiles_at_prev_share = tiles_scanned_total;
                 t_prev_share = now_hit;
+                // Ping-pong to sibling host slot immediately for zero-stall mining
+                g_active_host_slot = 1 - g_active_host_slot;
+                reclaim_host_slots(false, handoff_bt); // opportunistic non-blocking reclaim
+
                 if (g_mock) {
                     printf("[mock] first share enqueued (nonce=%llu); waiting for proof/verify\n",
                            (unsigned long long)nonce);
@@ -376,7 +409,11 @@ int cp_mine_job(const uint8_t *header, int hlen, const char *job_id, const char 
 job_done:
     if (g_share_queue) {
         cp_share_queue_end_job(g_share_queue);
-        cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_global, &h_BpT_global);
+        for (int s = 0; s < 2; s++) {
+            cp_share_queue_reclaim_matrices(g_share_queue, &h_Ap_slots[s], &h_BpT_slots[s]);
+        }
+        h_Ap_global = h_Ap_slots[g_active_host_slot];
+        h_BpT_global = h_BpT_slots[g_active_host_slot];
     }
     free(h_A_scan);
     free(h_B_scan);

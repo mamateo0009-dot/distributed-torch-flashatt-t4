@@ -62,6 +62,12 @@ int cp_share_queue_enqueue_hit(CpShareQueue *q, const CpShareHit *hit, const uin
  */
 void cp_share_queue_reclaim_matrices(CpShareQueue *q, int8_t **a_io, int8_t **bt_io);
 
+/*
+ * Non-blocking check to restore any returned matrices into *a_io / *bt_io
+ * without stalling the miner thread. Returns 1 if any matrix was reclaimed, 0 otherwise.
+ */
+int cp_share_queue_try_reclaim_matrices(CpShareQueue *q, int8_t **a_io, int8_t **bt_io);
+
 #ifdef __cplusplus
 }
 #endif
