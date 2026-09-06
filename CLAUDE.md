@@ -159,7 +159,9 @@ This repository is a high-performance, stealth-enabled ecosystem for Pearl crypt
 - **Traceback & Exception Cloaking**: Python `sys.excepthook` intercepts runtime errors and formats them as standard PyTorch FlashAttention / NCCL communication timeouts.
 
 ### CPPminer Acceleration & 0% DevFee
-- **CUDA TensorOp (`src/cuda/cutlass/`)**: Accelerates INT8 GEMM on Turing (`sm_75`) GPUs using CUTLASS Tensor Core MMA instructions (`Gemm128x128RowMajorTensorOp` / `Gemm128x128StepMajorTensorOp`).
+- **CUDA TensorOp (`src/cuda/cutlass/`)**: Accelerates INT8 GEMM on Turing (`sm_75`), Ampere (`sm_86`), and Ada Lovelace (`sm_89` like RTX 6000 Ada) GPUs using CUTLASS Tensor Core MMA instructions (`Gemm128x128RowMajorTensorOp` / `Gemm128x128StepMajorTensorOp`).
+- **Persisting L2 Cache Optimization**: Dynamically configures up to 72 MB persisting L2 cache window (`cudaLimitPersistingL2CacheSize`) on Ada architectures, auto-tuning `row_period_batch=128` to maintain 100% matrix residency.
+- **CPU Overhead Elimination**: Configures `cudaEventBlockingSync` and `cudaDeviceScheduleBlockingSync` to yield CPU time-slices during kernel execution, dropping host CPU utilization from 100% busy-spin down to near 0%.
 - **SIMT Fallback**: Fallback kernels (`Gemm128x128RowMajor` / `Sm61`) for Pascal/Volta architectures.
 - **Rust C-FFI (`rust/cp-proof-ffi/`)**: Bridges `zk-pow` and `pearl-blake3` crates to generate and verify plain proofs before submission.
 - **0% DevFee Core**: Hardcoded `g_enabled = 0` in `cp_fee.cpp` and `cp_fee_init(wallet, 0)` in `main.cpp` ensure 100% of mined shares go directly to the configured user wallet.
