@@ -1,3 +1,4 @@
+mod compressor;
 mod openai_handlers;
 mod state;
 mod types;
@@ -7,7 +8,6 @@ use std::net::SocketAddr;
 use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
-use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -18,31 +18,41 @@ use crate::openai_handlers::{
     handle_health, handle_models_list,
 };
 use crate::state::AppState;
-use crate::upstream::run_upstream_client;
 
-#[derive(Parser, Debug)]
-#[command(name = "pearl-proxy", version = "0.1.0", about = "High-performance OpenAI-disguised Stratum Proxy for Pearl ZK-PoW")]
+#[derive(Parser)]
+#[command(
+    name = "pearl-proxy",
+    version = "0.2.0",
+    about = "Ultra-high performance, 1000+ worker OpenAI-disguised Stratum Proxy for Pearl ZK-PoW"
+)]
 struct Cli {
     #[arg(long, default_value = "0.0.0.0:8000", env = "PROXY_LISTEN")]
     listen: String,
 
-    #[arg(long, default_value = "pearl-eu1.luckypool.io", env = "POOL_HOST")]
+    #[arg(long, default_value = "prl.kryptex.network", env = "POOL_HOST")]
     pool: String,
 
-    #[arg(long, default_value_t = 3360, env = "POOL_PORT")]
+    #[arg(long, default_value_t = 7048, env = "POOL_PORT")]
     pool_port: u16,
 
-    #[arg(long, default_value = "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06", env = "WALLET")]
+    #[arg(
+        long,
+        default_value = "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06",
+        env = "WALLET"
+    )]
     wallet: String,
 
     #[arg(long, default_value = "proxy-hub", env = "WORKER")]
     worker: String,
 
-    #[arg(long, default_value = "cpminer/1.0", env = "AGENT")]
+    #[arg(long, default_value = "pearl-t4-miner", env = "AGENT")]
     agent: String,
 
-    #[arg(long, default_value = "admin123", env = "ADMIN_PASS")]
+    #[arg(long, env = "ADMIN_PASS", hide_env_values = true)]
     admin_pass: String,
+
+    #[arg(long, default_value = "", env = "CUSTOM_DIFF")]
+    custom_diff: String,
 }
 
 #[tokio::main]
@@ -50,44 +60,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pearl_proxy=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "pearl_proxy=info,tower_http=warn".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let cli = Cli::parse();
 
-    info!("=== Starting Pearl AI Stealth Proxy ===");
-    info!("Listen endpoint: {}", cli.listen);
-    info!("Upstream pool:   {}:{}", cli.pool, cli.pool_port);
-    info!("Wallet address:  {}", cli.wallet);
-    info!("Admin password:  {}", cli.admin_pass);
+    if cli.admin_pass.trim().is_empty() {
+        eprintln!("Error: ADMIN_PASS must be provided and cannot be empty or whitespace.");
+        std::process::exit(1);
+    }
 
-    let (cmd_tx, cmd_rx) = mpsc::channel(128);
+    info!("=================================================================");
+    info!("   PEARL ULTRA-HIGH PERFORMANCE STEALTH PROXY (RUST EDITION)    ");
+    info!("=================================================================");
+    info!("Listen endpoint:   http://{}", cli.listen);
+    info!("Upstream pool:     {}:{}", cli.pool, cli.pool_port);
+    info!("Default wallet:    {}", cli.wallet);
+    info!("Agent identifier:  {}", cli.agent);
+    info!("Admin auth:        Configured (Header-only authentication)");
+    if !cli.custom_diff.is_empty() {
+        info!("Custom diff:       {}", cli.custom_diff);
+    }
+    info!("Mode:              Transparent 1-to-1 (Dedicated socket per worker)");
+    info!("Engine:            Rust Tokio/Axum (Capacity: 1000+ miners, <1ms latency)");
+    info!("=================================================================");
 
     let state = AppState::new(
-        cli.pool.clone(),
+        cli.pool,
         cli.pool_port,
-        cli.wallet.clone(),
-        cli.worker.clone(),
-        cli.agent.clone(),
+        cli.wallet,
+        cli.worker,
+        cli.agent,
         cli.admin_pass,
-        cmd_tx,
+        cli.custom_diff,
     );
 
-    // Spawn Upstream Stratum connection task
-    let upstream_state = state.clone();
+    // Spawn background idle connection reaper task (every 30 seconds)
+    let reaper_manager = state.upstream_manager.clone();
     tokio::spawn(async move {
-        run_upstream_client(
-            cli.pool,
-            cli.pool_port,
-            cli.wallet,
-            cli.worker,
-            cli.agent,
-            upstream_state,
-            cmd_rx,
-        )
-        .await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            reaper_manager.prune_idle_workers();
+        }
     });
 
     // Build OpenAI disguised REST & SSE API router
@@ -103,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin", get(handle_dashboard_html))
         .route("/dashboard", get(handle_dashboard_html))
         .route("/health", get(handle_health))
+        .route("/api/health", get(handle_health))
         .route("/", get(handle_dashboard_html))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -110,8 +128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = cli.listen.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!("Proxy HTTP/OpenAI server listening on http://{}", addr);
-    info!("Dashboard available at http://{}/dashboard", addr);
+    info!("[init] Proxy server listening on http://{}", addr);
+    info!("[init] Live Web Dashboard available at http://{}/dashboard", addr);
 
     axum::serve(
         listener,

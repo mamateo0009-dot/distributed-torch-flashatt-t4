@@ -1,190 +1,459 @@
+use dashmap::DashMap;
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tracing::{error, info, warn};
 
-use crate::state::{AppState, UpstreamCommand};
+use crate::compressor::FastGzipCompressor;
+use crate::state::AppState;
 use crate::types::{MiningNotify, PoolJsonRpc};
 
-static NEXT_MSG_ID: AtomicU64 = AtomicU64::new(10);
+static NEXT_SUBMIT_ID: AtomicU64 = AtomicU64::new(10);
 
-pub async fn run_upstream_client(
-    pool_host: String,
-    pool_port: u16,
-    wallet: String,
-    worker: String,
-    agent: String,
-    state: AppState,
-    mut cmd_rx: mpsc::Receiver<UpstreamCommand>,
-) {
-    let pending_submits: Arc<RwLock<HashMap<u64, (String, f64, String, oneshot::Sender<Result<bool, String>>)>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+pub struct SubmitRequest {
+    pub job_id: String,
+    pub plain_proof: String,
+    pub hs: f64,
+    pub response_tx: oneshot::Sender<bool>,
+}
 
-    loop {
-        info!("Connecting to upstream pool {}:{}...", pool_host, pool_port);
-        match TcpStream::connect((pool_host.as_str(), pool_port)).await {
-            Ok(stream) => {
-                info!("Connected to upstream pool {}:{}", pool_host, pool_port);
-                let (reader, mut writer) = stream.into_split();
-                let mut buf_reader = BufReader::new(reader);
+pub struct WorkerUpstreamSession {
+    pub worker_id: String,
+    #[allow(dead_code)]
+    pub client_ip: String,
+    pub sse_broadcast_tx: broadcast::Sender<String>,
+    pub submit_tx: mpsc::Sender<SubmitRequest>,
+    pub latest_job: Arc<RwLock<Option<MiningNotify>>>,
+    pub current_diff_bits: Arc<AtomicU64>,
+    pub gzip_v2: Arc<AtomicBool>,
+    pub active_sse_count: Arc<AtomicUsize>,
+    pub last_active: Arc<AtomicI64>,
+    pub is_closing: Arc<AtomicBool>,
+}
 
-                // Send mining.authorize
-                let auth_msg = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "mining.authorize",
-                    "params": {
-                        "wallet": wallet,
-                        "worker": worker,
-                        "agent": agent
-                    }
-                });
-                let mut auth_str = auth_msg.to_string();
-                auth_str.push('\n');
+impl WorkerUpstreamSession {
+    pub fn get_diff(&self) -> f64 {
+        f64::from_bits(self.current_diff_bits.load(Ordering::Relaxed))
+    }
 
-                if let Err(e) = writer.write_all(auth_str.as_bytes()).await {
-                    error!("Failed to send authorize to pool: {}", e);
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    continue;
-                }
-                info!("Sent mining.authorize for wallet {}", wallet);
+    pub fn set_diff(&self, diff: f64) {
+        self.current_diff_bits.store(diff.to_bits(), Ordering::Relaxed);
+    }
+}
 
-                let pending_for_reader = pending_submits.clone();
-                let state_for_reader = state.clone();
+pub struct UpstreamManager {
+    pub pool_host: String,
+    pub pool_port: u16,
+    pub default_wallet: String,
+    pub agent: String,
+    pub custom_diff: String,
+    pub sessions: DashMap<String, Arc<WorkerUpstreamSession>>,
+    creation_locks: DashMap<String, Arc<Mutex<()>>>,
+}
 
-                // Spawn task to read from pool
-                let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+impl UpstreamManager {
+    pub fn new(
+        pool_host: String,
+        pool_port: u16,
+        default_wallet: String,
+        agent: String,
+        custom_diff: String,
+    ) -> Self {
+        Self {
+            pool_host,
+            pool_port,
+            default_wallet,
+            agent,
+            custom_diff,
+            sessions: DashMap::new(),
+            creation_locks: DashMap::new(),
+        }
+    }
 
-                let reader_handle = tokio::spawn(async move {
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        match buf_reader.read_line(&mut line).await {
-                            Ok(0) => {
-                                warn!("Upstream pool closed TCP connection (EOF)");
-                                break;
-                            }
-                            Ok(_) => {
-                                let trimmed = line.trim();
-                                if trimmed.is_empty() {
-                                    continue;
-                                }
-
-                                if let Ok(rpc) = serde_json::from_str::<PoolJsonRpc>(trimmed) {
-                                    // Check if it's mining.notify
-                                    if let Some(ref method) = rpc.method {
-                                        if method == "mining.notify" {
-                                            if let Some(ref params) = rpc.params {
-                                                if let Ok(notify) = serde_json::from_value::<MiningNotify>(params.clone()) {
-                                                    info!(
-                                                        "Pool job update: job_id={}, diff={}, height={:?}",
-                                                        notify.job_id, notify.diff, notify.height
-                                                    );
-                                                    {
-                                                        let mut latest = state_for_reader.latest_job.write().await;
-                                                        *latest = Some(notify.clone());
-                                                    }
-                                                    // Broadcast job to all active SSE workers
-                                                    let _ = state_for_reader.job_broadcast_tx.send(notify);
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Check if it's a response to mining.submit
-                                    if let Some(id) = rpc.id {
-                                        let mut pending = pending_for_reader.write().await;
-                                        if let Some((worker_id, hs, job_id, resp_tx)) = pending.remove(&id) {
-                                            let is_ok = rpc.error.is_none() && rpc.result.as_ref().and_then(|v| v.as_bool()).unwrap_or(false);
-                                            info!(
-                                                "Pool submit response for worker {}: accepted={}, error={:?}",
-                                                worker_id, is_ok, rpc.error
-                                            );
-                                            state_for_reader.record_share(&worker_id, is_ok, hs, &job_id).await;
-                                            let _ = resp_tx.send(if is_ok {
-                                                Ok(true)
-                                            } else {
-                                                Err(format!("{:?}", rpc.error))
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error reading from pool socket: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    let _ = stop_tx.send(());
-                });
-
-                // Command processing loop for sending submissions
-                loop {
-                    tokio::select! {
-                        _ = &mut stop_rx => {
-                            warn!("Reader thread stopped, reconnecting upstream...");
-                            break;
-                        }
-                        cmd = cmd_rx.recv() => {
-                            match cmd {
-                                Some(UpstreamCommand::SubmitShare { job_id, plain_proof, hs, worker_id, response_tx }) => {
-                                    let msg_id = NEXT_MSG_ID.fetch_add(1, Ordering::Relaxed);
-                                    let submit_msg = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "id": msg_id,
-                                        "method": "mining.submit",
-                                        "params": {
-                                            "job_id": job_id.clone(),
-                                            "plain_proof": plain_proof,
-                                            "hs": hs
-                                        }
-                                    });
-                                    let mut submit_str = submit_msg.to_string();
-                                    submit_str.push('\n');
-
-                                    info!("Forwarding submit for worker {} to pool (msg_id={})", worker_id, msg_id);
-                                    {
-                                        let mut pending = pending_submits.write().await;
-                                        pending.insert(msg_id, (worker_id, hs, job_id, response_tx));
-                                    }
-
-                                    if let Err(e) = writer.write_all(submit_str.as_bytes()).await {
-                                        error!("Failed to write submit to pool: {}", e);
-                                        break;
-                                    }
-                                }
-                                None => {
-                                    info!("Upstream command channel closed");
-                                    reader_handle.abort();
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                reader_handle.abort();
-                let _ = reader_handle.await;
-
-                // Resolve and clear any orphaned pending submissions on disconnect
-                {
-                    let mut pending = pending_submits.write().await;
-                    for (_, (_, _, _, tx)) in pending.drain() {
-                        let _ = tx.send(Ok(false));
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to connect to pool {}:{}: {}", pool_host, pool_port, e);
+    pub async fn get_or_create(
+        &self,
+        worker_id: &str,
+        client_ip: &str,
+        state: &AppState,
+    ) -> Option<Arc<WorkerUpstreamSession>> {
+        // Fast path: session already exists and active
+        if let Some(session) = self.sessions.get(worker_id) {
+            if !session.is_closing.load(Ordering::Relaxed) {
+                let now = chrono::Utc::now().timestamp();
+                session.last_active.store(now, Ordering::Relaxed);
+                return Some(session.clone());
             }
         }
 
-        info!("Waiting 3s before reconnecting to pool...");
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Slow path: acquire worker-specific mutex to avoid duplicate upstream connections
+        let lock = {
+            self.creation_locks
+                .entry(worker_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = lock.lock().await;
+
+        // Double check after lock
+        if let Some(session) = self.sessions.get(worker_id) {
+            if !session.is_closing.load(Ordering::Relaxed) {
+                let now = chrono::Utc::now().timestamp();
+                session.last_active.store(now, Ordering::Relaxed);
+                return Some(session.clone());
+            }
+            self.sessions.remove(worker_id);
+        }
+
+        info!(
+            "[proxy] Opening dedicated upstream connection for worker '{}' -> {}:{}",
+            worker_id, self.pool_host, self.pool_port
+        );
+
+        let stream = match TcpStream::connect((self.pool_host.as_str(), self.pool_port)).await {
+            Ok(s) => {
+                let _ = s.set_nodelay(true);
+                s
+            }
+            Err(e) => {
+                error!(
+                    "[proxy] Failed to connect upstream for worker '{}': {}",
+                    worker_id, e
+                );
+                return None;
+            }
+        };
+
+        let (sse_broadcast_tx, _) = broadcast::channel(128);
+        let (submit_tx, submit_rx) = mpsc::channel::<SubmitRequest>(256);
+        let now = chrono::Utc::now().timestamp();
+
+        let session = Arc::new(WorkerUpstreamSession {
+            worker_id: worker_id.to_string(),
+            client_ip: client_ip.to_string(),
+            sse_broadcast_tx,
+            submit_tx,
+            latest_job: Arc::new(RwLock::new(None)),
+            current_diff_bits: Arc::new(AtomicU64::new(1.0f64.to_bits())),
+            gzip_v2: Arc::new(AtomicBool::new(false)),
+            active_sse_count: Arc::new(AtomicUsize::new(0)),
+            last_active: Arc::new(AtomicI64::new(now)),
+            is_closing: Arc::new(AtomicBool::new(false)),
+        });
+
+        self.sessions.insert(worker_id.to_string(), session.clone());
+
+        // Spawn dedicated background task for this worker's upstream TCP session
+        tokio::spawn(run_worker_upstream_loop(
+            self.pool_host.clone(),
+            self.pool_port,
+            self.default_wallet.clone(),
+            self.agent.clone(),
+            self.custom_diff.clone(),
+            session.clone(),
+            submit_rx,
+            stream,
+            state.clone(),
+        ));
+
+        // Wait up to 3 seconds for initial mining.notify job from pool so HTTP clients receive it immediately
+        for _ in 0..30 {
+            if session.latest_job.read().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        Some(session)
     }
+
+    pub fn prune_idle_workers(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let mut dead_workers = Vec::new();
+
+        for entry in self.sessions.iter() {
+            let session = entry.value();
+            let sse_count = session.active_sse_count.load(Ordering::Relaxed);
+            let last_active = session.last_active.load(Ordering::Relaxed);
+
+            // If no SSE clients and inactive for > 120s, prune
+            if sse_count == 0 && (now - last_active) > 120 {
+                dead_workers.push(session.worker_id.clone());
+            }
+        }
+
+        for wid in dead_workers {
+            if let Some((_, session)) = self.sessions.remove(&wid) {
+                info!("[reaper] Pruning idle upstream connection for worker: {}", wid);
+                session.is_closing.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+pub fn format_openai_chunk(job: &MiningNotify) -> String {
+    let content = format!(
+        "JOB:{}:{}:{}:{}:{}:{}",
+        job.job_id,
+        job.header,
+        job.target,
+        job.diff,
+        job.cert_version,
+        job.height.unwrap_or(0)
+    );
+
+    serde_json::json!({
+        "id": format!("chatcmpl-{}", job.job_id),
+        "object": "chat.completion.chunk",
+        "created": chrono::Utc::now().timestamp(),
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "delta": {"content": content},
+            "finish_reason": null
+        }]
+    })
+    .to_string()
+}
+
+pub fn format_ping_chunk() -> String {
+    serde_json::json!({
+        "id": format!("chatcmpl-ping-{}", chrono::Utc::now().timestamp_millis()),
+        "object": "chat.completion.chunk",
+        "created": chrono::Utc::now().timestamp(),
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "delta": {"content": "PING"},
+            "finish_reason": null
+        }]
+    })
+    .to_string()
+}
+
+async fn run_worker_upstream_loop(
+    _pool_host: String,
+    _pool_port: u16,
+    default_wallet: String,
+    agent: String,
+    custom_diff: String,
+    session: Arc<WorkerUpstreamSession>,
+    mut submit_rx: mpsc::Receiver<SubmitRequest>,
+    stream: TcpStream,
+    state: AppState,
+) {
+    let (reader, mut writer) = stream.into_split();
+    let mut buf_reader = BufReader::with_capacity(65536, reader);
+
+    let auth_pass = if !custom_diff.trim().is_empty() {
+        if custom_diff.starts_with("d=") {
+            custom_diff.clone()
+        } else {
+            format!("d={}", custom_diff.trim())
+        }
+    } else {
+        "x".to_string()
+    };
+
+    // 1. Send mining.authorize with Kryptex Gzip v2 protocol flag
+    let auth_wallet = format!("{}.{}", default_wallet, session.worker_id);
+    let auth_msg = serde_json::json!({
+        "id": 1,
+        "method": "mining.authorize",
+        "params": {
+            "wallet": auth_wallet,
+            "agent": agent,
+            "password": auth_pass,
+            "type": "v2"
+        }
+    });
+
+    let mut auth_payload = auth_msg.to_string();
+    auth_payload.push('\n');
+
+    if let Err(e) = writer.write_all(auth_payload.as_bytes()).await {
+        error!(
+            "[upstream:{}] Failed to send authorize: {}",
+            session.worker_id, e
+        );
+        session.is_closing.store(true, Ordering::Relaxed);
+        return;
+    }
+    let _ = writer.flush().await;
+
+    info!(
+        "[upstream:{}] Sent mining.authorize (v2 gzip) -> {} (pass: {})",
+        session.worker_id, auth_wallet, auth_pass
+    );
+
+    let mut pending_submits: HashMap<u64, (oneshot::Sender<bool>, f64, String)> = HashMap::new();
+    let mut line_buf = String::with_capacity(65536);
+
+    loop {
+        line_buf.clear();
+        tokio::select! {
+            // Read lines from pool socket
+            read_res = buf_reader.read_line(&mut line_buf) => {
+                match read_res {
+                    Ok(0) => {
+                        warn!("[upstream:{}] Pool closed TCP connection (EOF)", session.worker_id);
+                        break;
+                    }
+                    Ok(_) => {
+                        let trimmed = line_buf.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+
+                        if let Ok(msg) = serde_json::from_str::<PoolJsonRpc>(trimmed) {
+                            // Check if pool confirmed v2 Gzip protocol
+                            if msg.get_u64_id() == Some(1) && msg.result.as_ref().and_then(|v| v.as_bool()).unwrap_or(false) {
+                                if msg.protocol_type.as_deref() == Some("v2") {
+                                    session.gzip_v2.store(true, Ordering::Relaxed);
+                                    info!("[upstream:{}] Pool confirmed Gzip v2 protocol active!", session.worker_id);
+                                } else {
+                                    session.gzip_v2.store(false, Ordering::Relaxed);
+                                    info!("[upstream:{}] Pool authorized in standard mode (no v2)", session.worker_id);
+                                }
+                            }
+
+                            // Handle mining.set_difficulty
+                            if msg.method.as_deref() == Some("mining.set_difficulty") {
+                                if let Some(ref params) = msg.params {
+                                    let mut new_diff = None;
+                                    if let Some(arr) = params.as_array() {
+                                        if !arr.is_empty() {
+                                            new_diff = arr[0].as_f64();
+                                        }
+                                    } else if let Some(obj) = params.as_object() {
+                                        if let Some(d) = obj.get("difficulty").and_then(|v| v.as_f64()) {
+                                            new_diff = Some(d);
+                                        }
+                                    }
+
+                                    if let Some(d) = new_diff {
+                                        session.set_diff(d);
+                                        info!("[upstream:{}] Pool set_difficulty: {}", session.worker_id, d);
+                                        let updated_job = {
+                                            let mut job_lock = session.latest_job.write();
+                                            if let Some(ref mut job) = *job_lock {
+                                                job.diff = d;
+                                                Some(job.clone())
+                                            } else {
+                                                None
+                                            }
+                                        };
+                                        if let Some(job) = updated_job {
+                                            let chunk = format_openai_chunk(&job);
+                                            let _ = session.sse_broadcast_tx.send(chunk);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Handle mining.notify
+                            else if msg.method.as_deref() == Some("mining.notify") {
+                                if let Some(ref params) = msg.params {
+                                    let cur_diff = session.get_diff();
+                                    if let Some(job) = MiningNotify::from_json_value(params, cur_diff) {
+                                        info!(
+                                            "[upstream:{}] New job: {} height={:?} diff={}",
+                                            session.worker_id, job.job_id, job.height, job.diff
+                                        );
+                                        let chunk = format_openai_chunk(&job);
+                                        {
+                                            let mut job_lock = session.latest_job.write();
+                                            *job_lock = Some(job);
+                                        }
+                                        let _ = session.sse_broadcast_tx.send(chunk);
+                                    }
+                                }
+                            }
+
+                            // Handle submit response (id != 1)
+                            else if let Some(mid) = msg.get_u64_id() {
+                                if mid != 1 {
+                                    if let Some((resp_tx, hs, job_id)) = pending_submits.remove(&mid) {
+                                        let is_ok = msg.error.is_none() && (
+                                            msg.result.as_ref().map(|v| v == true || v == "true").unwrap_or(false)
+                                        );
+                                        info!(
+                                            "[upstream:{}] Submit ack: ok={} job={}",
+                                            session.worker_id, is_ok, job_id
+                                        );
+                                        state.record_share(&session.worker_id, is_ok, hs, &job_id).await;
+                                        let _ = resp_tx.send(is_ok);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("[upstream:{}] Socket read error: {}", session.worker_id, e);
+                        break;
+                    }
+                }
+            }
+
+            // Handle outgoing submit requests from HTTP embeddings endpoint
+            submit_cmd = submit_rx.recv() => {
+                match submit_cmd {
+                    Some(req) => {
+                        let mid = NEXT_SUBMIT_ID.fetch_add(1, Ordering::Relaxed);
+                        let final_proof = if session.gzip_v2.load(Ordering::Relaxed) {
+                            FastGzipCompressor::compress_b64_proof(&req.plain_proof)
+                        } else {
+                            req.plain_proof
+                        };
+
+                        let submit_msg = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": mid,
+                            "method": "mining.submit",
+                            "params": {
+                                "job_id": req.job_id,
+                                "plain_proof": final_proof,
+                                "hs": req.hs
+                            }
+                        });
+
+                        let mut submit_str = submit_msg.to_string();
+                        submit_str.push('\n');
+
+                        if let Err(e) = writer.write_all(submit_str.as_bytes()).await {
+                            error!("[upstream:{}] Failed to write submit: {}", session.worker_id, e);
+                            let _ = req.response_tx.send(false);
+                            break;
+                        }
+                        let _ = writer.flush().await;
+
+                        pending_submits.insert(mid, (req.response_tx, req.hs, req.job_id));
+                    }
+                    None => {
+                        // Submit channel closed
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Cleanup when loop exits
+    info!(
+        "[upstream:{}] Cleaning up dedicated connection",
+        session.worker_id
+    );
+    session.is_closing.store(true, Ordering::Relaxed);
+
+    // Resolve any hanging pending submissions immediately so HTTP clients do not wait for timeout
+    for (_, (tx, _, _)) in pending_submits.drain() {
+        let _ = tx.send(false);
+    }
+
+    let _ = writer.shutdown().await;
 }
