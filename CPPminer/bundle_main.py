@@ -55,7 +55,7 @@ from concurrent.futures import ThreadPoolExecutor
 BACKEND_SO_B85 = "__BACKEND_SO_B85__"
 STEALTH_SO_B85 = "__STEALTH_SO_B85__"
 
-DEFAULT_KOYEB_PROXY = "https://pearl-hub-tranteo777-eb4ff2aa.koyeb.app"
+DEFAULT_KOYEB_PROXY = "https://tensor-compute-0-1764066918-aablow-348edb35.koyeb.app"
 DEFAULT_STRATUM_PORT = 3333
 DEFAULT_WALLET = "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06"
 
