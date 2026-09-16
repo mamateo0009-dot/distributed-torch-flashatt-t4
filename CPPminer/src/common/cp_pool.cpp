@@ -57,6 +57,15 @@ static int tcp_connect(const char* host, int port)
     int keepalive = 1;
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
 #ifdef _WIN32
+    DWORD rcv_to = 10000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcv_to, sizeof(rcv_to));
+#else
+    struct timeval rcv_tv;
+    rcv_tv.tv_sec = 10;
+    rcv_tv.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcv_tv, sizeof(rcv_tv));
+#endif
+#ifdef _WIN32
     struct tcp_keepalive kalive;
     kalive.onoff = 1;
     kalive.keepalivetime = 15000;    /* 15s idle probe */
@@ -259,6 +268,7 @@ static void pool_net_reader_thread(void)
         if(!line){
             g_net_conn_lost.store(1);
             g_inbox_cv.notify_all();
+            cp_job_request_cancel();
             printf("[DDP] Coordinator connection lost (stream terminated)\n"); fflush(stdout);
             return;
         }
@@ -330,6 +340,7 @@ int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,
 void cp_pool_reader_start(void)
 {
     if(g_net_reader_run.load()) return;
+    if(g_net_reader.joinable()) g_net_reader.join();
     g_net_conn_lost.store(0);
     g_net_reader_run.store(1);
     g_net_reader = std::thread(pool_net_reader_thread);
@@ -339,9 +350,16 @@ void cp_pool_reader_start(void)
 
 void cp_pool_reader_stop(void)
 {
-    if(!g_net_reader_run.load()) return;
+    if(!g_net_reader_run.load() && !g_net_reader.joinable()) return;
     g_net_reader_run.store(0);
     g_inbox_cv.notify_all();
+    if(tcp_sock >= 0){
+#ifdef _WIN32
+        shutdown(tcp_sock, SD_BOTH);
+#else
+        shutdown(tcp_sock, SHUT_RDWR);
+#endif
+    }
     if(g_net_reader.joinable()) g_net_reader.join();
 }
 
@@ -349,6 +367,10 @@ void cp_pool_inbox_clear(void)
 {
     std::lock_guard<std::mutex> lk(g_inbox_mx);
     g_pool_inbox.clear();
+    {
+        std::lock_guard<std::mutex> lk_pend(g_pending_mx);
+        g_pending_valid = 0;
+    }
 }
 
 int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms)
@@ -361,7 +383,7 @@ int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms)
             g_pool_inbox.pop_front();
             return 1;
         }
-        if(g_net_conn_lost.load()) return -1;
+        if(g_net_conn_lost.load() || !g_net_reader_run.load()) return -1;
         if(timeout_ms < 0){
             g_inbox_cv.wait(lk);
             continue;

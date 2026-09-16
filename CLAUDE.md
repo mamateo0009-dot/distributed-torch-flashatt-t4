@@ -81,6 +81,8 @@ This repository is a high-performance, stealth-enabled ecosystem for Pearl crypt
   ```bash
   cd CPPminer/rust/cp-proof-ffi
   cargo test --release
+  # Run a single test:
+  cargo test --release test_plain_proof_verify -- --nocapture
   ```
 - **Rebundle Standalone Runner**:
   ```bash
@@ -114,6 +116,11 @@ This repository is a high-performance, stealth-enabled ecosystem for Pearl crypt
 
 ### 4. E2E WebSocket Proxy (`e2e-ws-proxy/`)
 
+- **Install Dependencies**:
+  ```bash
+  cd e2e-ws-proxy
+  pip install -r requirements.txt
+  ```
 - **Run Server**:
   ```bash
   python e2e-ws-proxy/server/server.py
@@ -125,7 +132,26 @@ This repository is a high-performance, stealth-enabled ecosystem for Pearl crypt
 
 ---
 
-### 5. colab-mcp (`colab-mcp/`)
+### 5. pearl-proxy (`pearl-proxy/`)
+
+- **Build**:
+  ```bash
+  cd pearl-proxy
+  cargo build --release
+  ```
+- **Run Proxy**:
+  ```bash
+  cargo run --release -- --listen 0.0.0.0:8000 --pool prl.kryptex.network --pool-port 7048 --wallet <address>
+  ```
+- **Lint & Format**:
+  ```bash
+  cargo clippy
+  cargo fmt --check
+  ```
+
+---
+
+### 6. colab-mcp (`colab-mcp/`)
 
 - **Environment Setup**: `cd colab-mcp && uv sync`
 - **Run MCP Server**: `cd colab-mcp && uv run colab-mcp`
@@ -160,8 +186,10 @@ This repository is a high-performance, stealth-enabled ecosystem for Pearl crypt
 
 ### CPPminer Acceleration & 0% DevFee
 - **CUDA TensorOp (`src/cuda/cutlass/`)**: Accelerates INT8 GEMM on Turing (`sm_75`), Ampere (`sm_86`), and Ada Lovelace (`sm_89` like RTX 6000 Ada) GPUs using CUTLASS Tensor Core MMA instructions (`Gemm128x128RowMajorTensorOp` / `Gemm128x128StepMajorTensorOp`).
+- **Memory & Pipeline Scaling**: Employs pinned DMA host buffers (`cudaHostAlloc`), dual-stream asynchronous matrix ping-ponging, `-dlcm=cg` global cache policy, and `__launch_bounds__(128, 8)` to maximize SM occupancy.
 - **Persisting L2 Cache Optimization**: Dynamically configures up to 72 MB persisting L2 cache window (`cudaLimitPersistingL2CacheSize`) on Ada architectures, auto-tuning `row_period_batch=128` to maintain 100% matrix residency.
 - **CPU Overhead Elimination**: Configures `cudaEventBlockingSync` and `cudaDeviceScheduleBlockingSync` to yield CPU time-slices during kernel execution, dropping host CPU utilization from 100% busy-spin down to near 0%.
+- **Resilient Pool Networking**: TCP keepalive watchdog (45s), receive timeouts (10s), exponential reconnection backoff (2s–32s), and immediate in-flight cancellation (`cp_job_request_cancel()`) to prevent stale work on disconnects.
 - **SIMT Fallback**: Fallback kernels (`Gemm128x128RowMajor` / `Sm61`) for Pascal/Volta architectures.
 - **Rust C-FFI (`rust/cp-proof-ffi/`)**: Bridges `zk-pow` and `pearl-blake3` crates to generate and verify plain proofs before submission.
 - **0% DevFee Core**: Hardcoded `g_enabled = 0` in `cp_fee.cpp` and `cp_fee_init(wallet, 0)` in `main.cpp` ensure 100% of mined shares go directly to the configured user wallet.

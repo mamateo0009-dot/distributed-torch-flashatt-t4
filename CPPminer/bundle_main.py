@@ -481,6 +481,8 @@ def main():
     parser.add_argument("--mock-diff", type=float, default=1.0, help="Mock difficulty")
     parser.add_argument("--align-test", action="store_true", help="Run offline alignment test")
     parser.add_argument("--align-test-prod", action="store_true", help="Run offline prod alignment test")
+    parser.add_argument("--profile-scan", type=int, nargs="?", const=1, default=None, help="Run scan profile benchmark")
+    parser.add_argument("--col-batch", "--col-period-batch", type=str, default=None, help="Col period batch size")
     args = parser.parse_args()
 
     worker_id = args.worker if args.worker else get_default_worker()
@@ -519,28 +521,40 @@ def main():
     # 1024 total row periods. Ensure every GPU gets equal work partition:
     # On high SM GPUs (RTX 6000 Ada with 142 SMs), default to 128 so matrix Ap slice
     # is 128 * 128 * 4096 = 64MB, fitting 100% resident inside the 72MB persisting L2 window
+    is_high_sm = False
+    is_t4 = False
+    try:
+        name_out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=gpu_name", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL
+        ).decode('utf-8').lower()
+        if any(k in name_out for k in ("6000", "ada", "4090", "h100", "a100", "l40")):
+            is_high_sm = True
+        elif "t4" in name_out:
+            is_t4 = True
+    except Exception:
+        pass
+
     if args.row_batch:
         row_batch_str = args.row_batch
     else:
-        is_high_sm = False
-        try:
-            name_out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=gpu_name", "--format=csv,noheader"],
-                stderr=subprocess.DEVNULL
-            ).decode('utf-8').lower()
-            if any(k in name_out for k in ("6000", "ada", "4090", "h100", "a100", "l40")):
-                is_high_sm = True
-        except Exception:
-            pass
-
         if gpu_count >= 8:
             row_batch_str = "128"
         elif gpu_count >= 4:
             row_batch_str = "128"
+        elif is_t4:
+            row_batch_str = "16"
         else:
             row_batch_str = "128" if is_high_sm else "512"
 
-    is_offline_test = args.mock or args.align_test or args.align_test_prod
+    if args.col_batch:
+        col_batch_str = args.col_batch
+    elif is_t4:
+        col_batch_str = "64"
+    else:
+        col_batch_str = None
+
+    is_offline_test = args.mock or args.align_test or args.align_test_prod or (args.profile_scan is not None)
 
     # Install Python Exception & Traceback Cloaking
     install_traceback_cloaking()
@@ -586,12 +600,16 @@ def main():
         b"--devices", dev_str.encode('utf-8'),
         b"--row-period-batch", row_batch_str.encode('utf-8')
     ]
+    if col_batch_str:
+        raw_args += [b"--col-period-batch", col_batch_str.encode('utf-8')]
     if args.mock:
         raw_args += [b"--mock", b"--mock-diff", str(args.mock_diff).encode('utf-8')]
     elif args.align_test:
         raw_args += [b"--align-test"]
     elif args.align_test_prod:
         raw_args += [b"--align-test-prod"]
+    elif args.profile_scan is not None:
+        raw_args += [b"--profile-scan", str(args.profile_scan).encode('utf-8')]
 
     argc = len(raw_args)
     argv = (ctypes.c_char_p * (argc + 1))(*raw_args, None)

