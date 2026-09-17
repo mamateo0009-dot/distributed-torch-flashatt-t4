@@ -269,7 +269,7 @@ nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(nvmlDevice_t device, unsign
 nvmlReturn_t nvmlDeviceGetComputeRunningProcesses(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
     return nvmlDeviceGetComputeRunningProcesses_v2(device, infoCount, infos);
 }
-nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v2(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
+nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v2(nvmlDevice_t device, unsigned int *infoCount, const nvmlProcessInfo_t *infos) {
     (void)device;
     (void)infos;
     if (infoCount) {
@@ -277,7 +277,7 @@ nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v2(nvmlDevice_t device, unsig
     }
     return NVML_SUCCESS;
 }
-nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
+nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses(nvmlDevice_t device, unsigned int *infoCount, const nvmlProcessInfo_t *infos) {
     return nvmlDeviceGetGraphicsRunningProcesses_v2(device, infoCount, infos);
 }
 

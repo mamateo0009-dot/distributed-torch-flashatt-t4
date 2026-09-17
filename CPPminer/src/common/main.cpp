@@ -189,6 +189,42 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key, 
     return rc;
 }
 
+static int dispatch_main_pool_line(const char* line_buf, int* msg_id, char* cur_job_key, int* backoff_sec)
+{
+    if(strstr(line_buf, "mining.notify")){
+        int notify_ok = 0;
+        int rc = handle_notify_line(line_buf, msg_id, cur_job_key, &notify_ok);
+        if(notify_ok){
+            *backoff_sec = 0;
+        }
+        return (rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) ? 1 : 0;
+    }
+
+    if(strstr(line_buf, "mining.set_difficulty")){
+        double d = cp_json_num(line_buf, "params");
+        if(!d){
+            const char* p = strstr(line_buf, "\"params\":[");
+            if(p){
+                p = strchr(p, '[');
+                if(p) d = atof(p + 1);
+            }
+        }
+        if(d > 0.0){
+            cp_pool_set_difficulty(d);
+            printf("[pool] mining.set_difficulty %.0f\n", d); fflush(stdout);
+        }
+        return 0;
+    }
+
+    if(strstr(line_buf, "result") || strstr(line_buf, "error")){
+        printf("[pool] jsonrpc: %s\n", line_buf); fflush(stdout);
+        return 0;
+    }
+
+    printf("[pool] (unhandled) %s\n", line_buf); fflush(stdout);
+    return 0;
+}
+
 #ifdef _WIN32
 __declspec(dllexport) int start_training(int argc, char** argv)
 #else
@@ -916,38 +952,9 @@ extern "C" __attribute__((visibility("default"))) int start_training(int argc, c
                 break;
             }
 
-            if(strstr(line_buf, "mining.notify")){
-                int notify_ok = 0;
-                int rc = handle_notify_line(line_buf, &msg_id, cur_job_key, &notify_ok);
-                if(notify_ok){
-                    backoff_sec = 0;
-                }
-                if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) break;
-                continue;
+            if(dispatch_main_pool_line(line_buf, &msg_id, cur_job_key, &backoff_sec)){
+                break;
             }
-
-            if(strstr(line_buf, "mining.set_difficulty")){
-                double d = cp_json_num(line_buf, "params");
-                if(!d){
-                    const char* p = strstr(line_buf, "\"params\":[");
-                    if(p){
-                        p = strchr(p, '[');
-                        if(p) d = atof(p + 1);
-                    }
-                }
-                if(d > 0.0){
-                    cp_pool_set_difficulty(d);
-                    printf("[pool] mining.set_difficulty %.0f\n", d); fflush(stdout);
-                }
-                continue;
-            }
-
-            if(strstr(line_buf, "result") || strstr(line_buf, "error")){
-                printf("[pool] jsonrpc: %s\n", line_buf); fflush(stdout);
-                continue;
-            }
-
-            printf("[pool] (unhandled) %s\n", line_buf); fflush(stdout);
         }
     }
 
