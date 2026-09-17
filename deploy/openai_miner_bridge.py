@@ -88,6 +88,16 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
                 )
 
                 with urllib.request.urlopen(req, timeout=30) as resp:
+                    # Configure raw socket read timeout to prevent silent TCP hangs
+                    try:
+                        raw_sock = getattr(resp, 'fp', None)
+                        if raw_sock and hasattr(raw_sock, 'raw'):
+                            sock_obj = getattr(raw_sock.raw, '_sock', None)
+                            if sock_obj and hasattr(sock_obj, 'settimeout'):
+                                sock_obj.settimeout(25.0)
+                    except Exception:
+                        pass
+
                     for line in resp:
                         if stop_event.is_set():
                             break
@@ -165,25 +175,34 @@ def handle_miner_client(client_sock, proxy_url, wallet, worker):
 
         print(f"[BRIDGE] Submitting share for job {job_id} (proof len: {plain_proof_len}, hs: {hs:.0f}) to {embed_url}...", flush=True)
 
-        try:
-            with urllib.request.urlopen(embed_req, timeout=30) as embed_resp:
-                resp_data = embed_resp.read().decode('utf-8', errors='ignore')
-                print(f"[BRIDGE] Proxy submit response ({embed_resp.status}): {resp_data}", flush=True)
-                if embed_resp.status == 200:
-                    submit_res = json.dumps({"id": msg_id, "result": True, "error": None}) + "\n"
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(embed_req, timeout=30) as embed_resp:
+                    resp_data = embed_resp.read().decode('utf-8', errors='ignore')
+                    print(f"[BRIDGE] Proxy submit response ({embed_resp.status}): {resp_data}", flush=True)
+                    if embed_resp.status == 200:
+                        submit_res = json.dumps({"id": msg_id, "result": True, "error": None}) + "\n"
+                    else:
+                        submit_res = json.dumps({"id": msg_id, "result": False, "error": "Rejected"}) + "\n"
                     safe_send(submit_res)
-                else:
-                    submit_res = json.dumps({"id": msg_id, "result": False, "error": "Rejected"}) + "\n"
-                    safe_send(submit_res)
-        except urllib.error.HTTPError as he:
-            err_msg = "Rejected by pool" if he.code == 422 else f"HTTP {he.code}"
-            print(f"[BRIDGE] Share submit HTTP {he.code}: {err_msg}", flush=True)
-            submit_res = json.dumps({"id": msg_id, "result": False, "error": err_msg}) + "\n"
-            safe_send(submit_res)
-        except Exception as e:
-            print(f"[BRIDGE] Share submit error: {e}", flush=True)
-            submit_res = json.dumps({"id": msg_id, "result": False, "error": str(e)}) + "\n"
-            safe_send(submit_res)
+                    return
+            except urllib.error.HTTPError as he:
+                if he.code in (502, 503, 504) and attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                err_msg = "Rejected by pool" if he.code == 422 else f"HTTP {he.code}"
+                print(f"[BRIDGE] Share submit HTTP {he.code}: {err_msg}", flush=True)
+                submit_res = json.dumps({"id": msg_id, "result": False, "error": err_msg}) + "\n"
+                safe_send(submit_res)
+                return
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                print(f"[BRIDGE] Share submit error: {e}", flush=True)
+                submit_res = json.dumps({"id": msg_id, "result": False, "error": str(e)}) + "\n"
+                safe_send(submit_res)
+                return
 
     try:
         for line in client_file:

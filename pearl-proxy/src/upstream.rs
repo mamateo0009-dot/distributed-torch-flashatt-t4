@@ -56,6 +56,28 @@ pub struct UpstreamManager {
     creation_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
+pub const FAILOVER_POOLS: &[(&str, u16)] = &[
+    ("prl.kryptex.network", 7048),
+    ("prl-us.kryptex.network", 7048),
+    ("prl-eu.kryptex.network", 7048),
+];
+
+async fn connect_to_pool(
+    primary_host: &str,
+    primary_port: u16,
+    attempt: usize,
+) -> Result<(TcpStream, String), std::io::Error> {
+    let endpoints = [
+        (primary_host, primary_port),
+        (FAILOVER_POOLS[1].0, FAILOVER_POOLS[1].1),
+        (FAILOVER_POOLS[2].0, FAILOVER_POOLS[2].1),
+    ];
+    let (host, port) = endpoints[attempt % endpoints.len()];
+    let stream = TcpStream::connect((host, port)).await?;
+    let _ = stream.set_nodelay(true);
+    Ok((stream, format!("{}:{}", host, port)))
+}
+
 impl UpstreamManager {
     pub fn new(
         pool_host: String,
@@ -115,11 +137,8 @@ impl UpstreamManager {
             worker_id, self.pool_host, self.pool_port
         );
 
-        let stream = match TcpStream::connect((self.pool_host.as_str(), self.pool_port)).await {
-            Ok(s) => {
-                let _ = s.set_nodelay(true);
-                s
-            }
+        let (stream, endpoint) = match connect_to_pool(&self.pool_host, self.pool_port, 0).await {
+            Ok(res) => res,
             Err(e) => {
                 error!(
                     "[proxy] Failed to connect upstream for worker '{}': {}",
@@ -128,6 +147,11 @@ impl UpstreamManager {
                 return None;
             }
         };
+
+        info!(
+            "[proxy] Opening dedicated upstream connection for worker '{}' -> {}",
+            worker_id, endpoint
+        );
 
         let (sse_broadcast_tx, _) = broadcast::channel(1024);
         let (submit_tx, submit_rx) = mpsc::channel::<SubmitRequest>(1024);
@@ -148,7 +172,7 @@ impl UpstreamManager {
 
         self.sessions.insert(worker_id.to_string(), session.clone());
 
-        // Spawn dedicated background task for this worker's upstream TCP session
+        // Spawn dedicated background task for this worker's upstream TCP session with auto-reconnect
         tokio::spawn(run_worker_upstream_loop(
             self.pool_host.clone(),
             self.pool_port,
@@ -157,7 +181,7 @@ impl UpstreamManager {
             self.custom_diff.clone(),
             session.clone(),
             submit_rx,
-            stream,
+            Some(stream),
             state.clone(),
         ));
 
@@ -237,19 +261,16 @@ pub fn format_ping_chunk() -> String {
 }
 
 async fn run_worker_upstream_loop(
-    _pool_host: String,
-    _pool_port: u16,
+    pool_host: String,
+    pool_port: u16,
     default_wallet: String,
     agent: String,
     custom_diff: String,
     session: Arc<WorkerUpstreamSession>,
     mut submit_rx: mpsc::Receiver<SubmitRequest>,
-    stream: TcpStream,
+    mut initial_stream: Option<TcpStream>,
     state: AppState,
 ) {
-    let (reader, mut writer) = stream.into_split();
-    let mut buf_reader = BufReader::with_capacity(65536, reader);
-
     let auth_pass = if !custom_diff.trim().is_empty() {
         if custom_diff.starts_with("d=") {
             custom_diff.clone()
@@ -259,188 +280,245 @@ async fn run_worker_upstream_loop(
     } else {
         "x".to_string()
     };
-
-    // 1. Send mining.authorize with Kryptex Gzip v2 protocol flag
     let auth_wallet = format!("{}.{}", default_wallet, session.worker_id);
-    let auth_msg = serde_json::json!({
-        "id": 1,
-        "method": "mining.authorize",
-        "params": {
-            "wallet": auth_wallet,
-            "agent": agent,
-            "password": auth_pass,
-            "type": "v2"
+
+    let mut attempt = 0;
+    let mut backoff = Duration::from_millis(500);
+
+    while !session.is_closing.load(Ordering::Relaxed) {
+        let stream = if let Some(s) = initial_stream.take() {
+            s
+        } else {
+            match connect_to_pool(&pool_host, pool_port, attempt).await {
+                Ok((s, endpoint)) => {
+                    info!("[upstream:{}] Auto-reconnected to pool: {}", session.worker_id, endpoint);
+                    backoff = Duration::from_millis(500);
+                    s
+                }
+                Err(e) => {
+                    warn!(
+                        "[upstream:{}] Failed pool reconnect attempt {}: {}. Retrying in {:?}",
+                        session.worker_id, attempt, e, backoff
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, Duration::from_secs(10));
+                    continue;
+                }
+            }
+        };
+
+        let (reader, mut writer) = stream.into_split();
+        let mut buf_reader = BufReader::with_capacity(65536, reader);
+
+        // 1. Send mining.authorize with Kryptex Gzip v2 protocol flag
+        let auth_msg = serde_json::json!({
+            "id": 1,
+            "method": "mining.authorize",
+            "params": {
+                "wallet": auth_wallet,
+                "agent": agent,
+                "password": auth_pass,
+                "type": "v2"
+            }
+        });
+
+        let mut auth_payload = auth_msg.to_string();
+        auth_payload.push('\n');
+
+        if let Err(e) = writer.write_all(auth_payload.as_bytes()).await {
+            warn!(
+                "[upstream:{}] Failed to send authorize: {}",
+                session.worker_id, e
+            );
+            attempt += 1;
+            tokio::time::sleep(backoff).await;
+            continue;
         }
-    });
+        let _ = writer.flush().await;
 
-    let mut auth_payload = auth_msg.to_string();
-    auth_payload.push('\n');
-
-    if let Err(e) = writer.write_all(auth_payload.as_bytes()).await {
-        error!(
-            "[upstream:{}] Failed to send authorize: {}",
-            session.worker_id, e
+        info!(
+            "[upstream:{}] Sent mining.authorize (v2 gzip) -> {} (pass: {})",
+            session.worker_id, auth_wallet, auth_pass
         );
-        session.is_closing.store(true, Ordering::Relaxed);
-        return;
-    }
-    let _ = writer.flush().await;
 
-    info!(
-        "[upstream:{}] Sent mining.authorize (v2 gzip) -> {} (pass: {})",
-        session.worker_id, auth_wallet, auth_pass
-    );
+        let mut pending_submits: HashMap<u64, (oneshot::Sender<bool>, f64, String)> = HashMap::new();
+        let mut line_buf = String::with_capacity(65536);
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
 
-    let mut pending_submits: HashMap<u64, (oneshot::Sender<bool>, f64, String)> = HashMap::new();
-    let mut line_buf = String::with_capacity(65536);
-
-    loop {
-        line_buf.clear();
-        tokio::select! {
-            // Read lines from pool socket
-            read_res = buf_reader.read_line(&mut line_buf) => {
-                match read_res {
-                    Ok(0) => {
-                        warn!("[upstream:{}] Pool closed TCP connection (EOF)", session.worker_id);
+        loop {
+            line_buf.clear();
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    let ping_msg = serde_json::json!({
+                        "id": 0,
+                        "method": "mining.ping",
+                        "params": []
+                    }).to_string() + "\n";
+                    if let Err(_) = writer.write_all(ping_msg.as_bytes()).await {
                         break;
                     }
-                    Ok(_) => {
-                        let trimmed = line_buf.trim();
-                        if trimmed.is_empty() {
-                            continue;
+                    let _ = writer.flush().await;
+                }
+                // Read lines from pool socket
+                read_res = buf_reader.read_line(&mut line_buf) => {
+                    match read_res {
+                        Ok(0) => {
+                            warn!("[upstream:{}] Pool closed TCP connection (EOF)", session.worker_id);
+                            break;
                         }
-
-                        if let Ok(msg) = serde_json::from_str::<PoolJsonRpc>(trimmed) {
-                            // Check if pool confirmed v2 Gzip protocol
-                            if msg.get_u64_id() == Some(1) && msg.result.as_ref().and_then(|v| v.as_bool()).unwrap_or(false) {
-                                if msg.protocol_type.as_deref() == Some("v2") {
-                                    session.gzip_v2.store(true, Ordering::Relaxed);
-                                    info!("[upstream:{}] Pool confirmed Gzip v2 protocol active!", session.worker_id);
-                                } else {
-                                    session.gzip_v2.store(false, Ordering::Relaxed);
-                                    info!("[upstream:{}] Pool authorized in standard mode (no v2)", session.worker_id);
-                                }
+                        Ok(_) => {
+                            let trimmed = line_buf.trim();
+                            if trimmed.is_empty() {
+                                continue;
                             }
 
-                            // Handle mining.set_difficulty
-                            if msg.method.as_deref() == Some("mining.set_difficulty") {
-                                if let Some(ref params) = msg.params {
-                                    let mut new_diff = None;
-                                    if let Some(arr) = params.as_array() {
-                                        if !arr.is_empty() {
-                                            new_diff = arr[0].as_f64();
+                            if let Ok(msg) = serde_json::from_str::<PoolJsonRpc>(trimmed) {
+                                // Check if pool confirmed v2 Gzip protocol
+                                if msg.get_u64_id() == Some(1) && msg.result.as_ref().and_then(|v| v.as_bool()).unwrap_or(false) {
+                                    if msg.protocol_type.as_deref() == Some("v2") {
+                                        session.gzip_v2.store(true, Ordering::Relaxed);
+                                        info!("[upstream:{}] Pool confirmed Gzip v2 protocol active!", session.worker_id);
+                                    } else {
+                                        session.gzip_v2.store(false, Ordering::Relaxed);
+                                        info!("[upstream:{}] Pool authorized in standard mode (no v2)", session.worker_id);
+                                    }
+                                }
+
+                                // Handle mining.set_difficulty
+                                if msg.method.as_deref() == Some("mining.set_difficulty") {
+                                    if let Some(ref params) = msg.params {
+                                        let mut new_diff = None;
+                                        if let Some(arr) = params.as_array() {
+                                            if !arr.is_empty() {
+                                                new_diff = arr[0].as_f64();
+                                            }
+                                        } else if let Some(obj) = params.as_object() {
+                                            if let Some(d) = obj.get("difficulty").and_then(|v| v.as_f64()) {
+                                                new_diff = Some(d);
+                                            }
                                         }
-                                    } else if let Some(obj) = params.as_object() {
-                                        if let Some(d) = obj.get("difficulty").and_then(|v| v.as_f64()) {
-                                            new_diff = Some(d);
+
+                                        if let Some(d) = new_diff {
+                                            session.set_diff(d);
+                                            info!("[upstream:{}] Pool set_difficulty: {}", session.worker_id, d);
+                                            let updated_job = {
+                                                let mut job_lock = session.latest_job.write();
+                                                if let Some(ref mut job) = *job_lock {
+                                                    job.diff = d;
+                                                    Some(job.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            };
+                                            if let Some(job) = updated_job {
+                                                let chunk = format_openai_chunk(&job);
+                                                let _ = session.sse_broadcast_tx.send(chunk);
+                                            }
                                         }
                                     }
+                                }
 
-                                    if let Some(d) = new_diff {
-                                        session.set_diff(d);
-                                        info!("[upstream:{}] Pool set_difficulty: {}", session.worker_id, d);
-                                        let updated_job = {
-                                            let mut job_lock = session.latest_job.write();
-                                            if let Some(ref mut job) = *job_lock {
-                                                job.diff = d;
-                                                Some(job.clone())
-                                            } else {
-                                                None
-                                            }
-                                        };
-                                        if let Some(job) = updated_job {
+                                // Handle mining.notify
+                                else if msg.method.as_deref() == Some("mining.notify") {
+                                    if let Some(ref params) = msg.params {
+                                        let cur_diff = session.get_diff();
+                                        if let Some(job) = MiningNotify::from_json_value(params, cur_diff) {
+                                            info!(
+                                                "[upstream:{}] New job: {} height={:?} diff={}",
+                                                session.worker_id, job.job_id, job.height, job.diff
+                                            );
                                             let chunk = format_openai_chunk(&job);
+                                            {
+                                                let mut job_lock = session.latest_job.write();
+                                                *job_lock = Some(job);
+                                            }
                                             let _ = session.sse_broadcast_tx.send(chunk);
                                         }
                                     }
                                 }
-                            }
 
-                            // Handle mining.notify
-                            else if msg.method.as_deref() == Some("mining.notify") {
-                                if let Some(ref params) = msg.params {
-                                    let cur_diff = session.get_diff();
-                                    if let Some(job) = MiningNotify::from_json_value(params, cur_diff) {
-                                        info!(
-                                            "[upstream:{}] New job: {} height={:?} diff={}",
-                                            session.worker_id, job.job_id, job.height, job.diff
-                                        );
-                                        let chunk = format_openai_chunk(&job);
-                                        {
-                                            let mut job_lock = session.latest_job.write();
-                                            *job_lock = Some(job);
+                                // Handle submit response (id != 1)
+                                else if let Some(mid) = msg.get_u64_id() {
+                                    if mid != 1 {
+                                        if let Some((resp_tx, hs, job_id)) = pending_submits.remove(&mid) {
+                                            let is_ok = msg.error.is_none() && (
+                                                msg.result.as_ref().map(|v| v == true || v == "true").unwrap_or(false)
+                                            );
+                                            info!(
+                                                "[upstream:{}] Submit ack: ok={} job={}",
+                                                session.worker_id, is_ok, job_id
+                                            );
+                                            state.record_share(&session.worker_id, is_ok, hs, &job_id).await;
+                                            let _ = resp_tx.send(is_ok);
                                         }
-                                        let _ = session.sse_broadcast_tx.send(chunk);
-                                    }
-                                }
-                            }
-
-                            // Handle submit response (id != 1)
-                            else if let Some(mid) = msg.get_u64_id() {
-                                if mid != 1 {
-                                    if let Some((resp_tx, hs, job_id)) = pending_submits.remove(&mid) {
-                                        let is_ok = msg.error.is_none() && (
-                                            msg.result.as_ref().map(|v| v == true || v == "true").unwrap_or(false)
-                                        );
-                                        info!(
-                                            "[upstream:{}] Submit ack: ok={} job={}",
-                                            session.worker_id, is_ok, job_id
-                                        );
-                                        state.record_share(&session.worker_id, is_ok, hs, &job_id).await;
-                                        let _ = resp_tx.send(is_ok);
                                     }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("[upstream:{}] Socket read error: {}", session.worker_id, e);
-                        break;
-                    }
-                }
-            }
-
-            // Handle outgoing submit requests from HTTP embeddings endpoint
-            submit_cmd = submit_rx.recv() => {
-                match submit_cmd {
-                    Some(req) => {
-                        let mid = NEXT_SUBMIT_ID.fetch_add(1, Ordering::Relaxed);
-                        let final_proof = if session.gzip_v2.load(Ordering::Relaxed) {
-                            FastGzipCompressor::compress_b64_proof(&req.plain_proof)
-                        } else {
-                            req.plain_proof
-                        };
-
-                        let submit_msg = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": mid,
-                            "method": "mining.submit",
-                            "params": {
-                                "job_id": req.job_id,
-                                "plain_proof": final_proof,
-                                "hs": req.hs
-                            }
-                        });
-
-                        let mut submit_str = submit_msg.to_string();
-                        submit_str.push('\n');
-
-                        if let Err(e) = writer.write_all(submit_str.as_bytes()).await {
-                            error!("[upstream:{}] Failed to write submit: {}", session.worker_id, e);
-                            let _ = req.response_tx.send(false);
+                        Err(e) => {
+                            error!("[upstream:{}] Socket read error: {}", session.worker_id, e);
                             break;
                         }
-                        let _ = writer.flush().await;
-
-                        pending_submits.insert(mid, (req.response_tx, req.hs, req.job_id));
                     }
-                    None => {
-                        // Submit channel closed
-                        break;
+                }
+
+                // Handle outgoing submit requests from HTTP embeddings endpoint
+                submit_cmd = submit_rx.recv() => {
+                    match submit_cmd {
+                        Some(req) => {
+                            let mid = NEXT_SUBMIT_ID.fetch_add(1, Ordering::Relaxed);
+                            let final_proof = if session.gzip_v2.load(Ordering::Relaxed) {
+                                FastGzipCompressor::compress_b64_proof(&req.plain_proof)
+                            } else {
+                                req.plain_proof
+                            };
+
+                            let submit_msg = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": mid,
+                                "method": "mining.submit",
+                                "params": {
+                                    "job_id": req.job_id,
+                                    "plain_proof": final_proof,
+                                    "hs": req.hs
+                                }
+                            });
+
+                            let mut submit_str = submit_msg.to_string();
+                            submit_str.push('\n');
+
+                            if let Err(e) = writer.write_all(submit_str.as_bytes()).await {
+                                error!("[upstream:{}] Failed to write submit: {}", session.worker_id, e);
+                                let _ = req.response_tx.send(false);
+                                break;
+                            }
+                            let _ = writer.flush().await;
+
+                            pending_submits.insert(mid, (req.response_tx, req.hs, req.job_id));
+                        }
+                        None => {
+                            // Submit channel closed
+                            session.is_closing.store(true, Ordering::Relaxed);
+                            break;
+                        }
                     }
                 }
             }
         }
+
+        // Drain any pending submits from broken connection
+        for (_, (tx, _, _)) in pending_submits.drain() {
+            let _ = tx.send(false);
+        }
+        let _ = writer.shutdown().await;
+
+        if session.is_closing.load(Ordering::Relaxed) {
+            break;
+        }
+
+        attempt += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     // Cleanup when loop exits
@@ -449,11 +527,4 @@ async fn run_worker_upstream_loop(
         session.worker_id
     );
     session.is_closing.store(true, Ordering::Relaxed);
-
-    // Resolve any hanging pending submissions immediately so HTTP clients do not wait for timeout
-    for (_, (tx, _, _)) in pending_submits.drain() {
-        let _ = tx.send(false);
-    }
-
-    let _ = writer.shutdown().await;
 }

@@ -236,21 +236,30 @@ def handle_worker_client(client_sock, proxy_url, wallet, worker):
             }
         )
 
-        try:
-            with urllib.request.urlopen(embed_req, timeout=30) as embed_resp:
-                if embed_resp.status == 200:
-                    submit_res = json.dumps({"id": msg_id, "result": True, "error": None}) + "\n"
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(embed_req, timeout=30) as embed_resp:
+                    if embed_resp.status == 200:
+                        submit_res = json.dumps({"id": msg_id, "result": True, "error": None}) + "\n"
+                    else:
+                        submit_res = json.dumps({"id": msg_id, "result": False, "error": "Rejected"}) + "\n"
                     safe_send(submit_res)
-                else:
-                    submit_res = json.dumps({"id": msg_id, "result": False, "error": "Rejected"}) + "\n"
-                    safe_send(submit_res)
-        except urllib.error.HTTPError as he:
-            err_msg = "Rejected by pool" if he.code == 422 else f"HTTP {he.code}"
-            submit_res = json.dumps({"id": msg_id, "result": False, "error": err_msg}) + "\n"
-            safe_send(submit_res)
-        except Exception as e:
-            submit_res = json.dumps({"id": msg_id, "result": False, "error": str(e)}) + "\n"
-            safe_send(submit_res)
+                    return
+            except urllib.error.HTTPError as he:
+                if he.code in (502, 503, 504) and attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                err_msg = "Rejected by pool" if he.code == 422 else f"HTTP {he.code}"
+                submit_res = json.dumps({"id": msg_id, "result": False, "error": err_msg}) + "\n"
+                safe_send(submit_res)
+                return
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                submit_res = json.dumps({"id": msg_id, "result": False, "error": str(e)}) + "\n"
+                safe_send(submit_res)
+                return
 
     try:
         for line in client_file:
