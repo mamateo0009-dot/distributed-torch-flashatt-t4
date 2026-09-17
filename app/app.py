@@ -521,7 +521,7 @@ def main():
         elif gpu_count >= 4:
             row_batch_str = "128"
         elif is_t4:
-            row_batch_str = "16"
+            row_batch_str = "6"
         else:
             row_batch_str = "128" if is_high_sm else "512"
 

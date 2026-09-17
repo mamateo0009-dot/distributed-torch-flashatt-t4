@@ -228,6 +228,30 @@ static int dispatch_main_pool_line(const char* line_buf, int* msg_id, char* cur_
     return 0;
 }
 
+static void auto_detect_devices(int* devs, int* ndev)
+{
+    if(*ndev > 0){
+        return;
+    }
+#if defined(CP_ENABLE_CUDA) && CP_ENABLE_CUDA
+    if(cp_worker_backend_id() == CP_BACKEND_CUDA){
+        int cuda_count = cp_gpu_device_count();
+        if(cuda_count > 0){
+            if(cuda_count > MAX_GPUS){
+                cuda_count = MAX_GPUS;
+            }
+            for(int d = 0; d < cuda_count; d++){
+                devs[d] = d;
+            }
+            *ndev = cuda_count;
+            return;
+        }
+    }
+#endif
+    devs[0] = 0;
+    *ndev = 1;
+}
+
 #ifdef _WIN32
 __declspec(dllexport) int start_training(int argc, char** argv)
 #else
@@ -692,7 +716,7 @@ extern "C" __attribute__((visibility("default"))) int start_training(int argc, c
             return 1;
         }
     }
-    if(!ndev){ devs[0] = 0; ndev = 1; }
+    auto_detect_devices(devs, &ndev);
 
     if(g_mock){
         /* Offline self-test: no pool submit; always verify the first share. */

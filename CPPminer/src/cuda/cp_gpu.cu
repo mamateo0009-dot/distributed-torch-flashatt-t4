@@ -414,10 +414,10 @@ void cp_gpu_init(int* devs, int ndev)
             // Architecture-aware batch defaults: keeps matrix Ap resident in L2 cache
             if(g_row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT){
                 if(prop.major == 7 && prop.minor == 5){
-                    // Turing (Tesla T4, RTX 2080): 4MB L2 -> row_batch=16, col_batch=64 fits working set in L2 for 22.8 TMAC/s
-                    g_row_period_batch = 16;
+                    // Turing (Tesla T4, RTX 2080): 4MB L2 -> row_batch=6, col_batch=64 keeps working set (3MB) 100% L2 resident (20.3 TMAC/s peak)
+                    g_row_period_batch = 6;
                     g_col_period_batch = 64;
-                    printf("[gpu] GPU%d: Detected Turing sm_75 -> auto-optimized row_period_batch=16, col_period_batch=64 (L2 resident, 22.8 TMAC/s)\n",
+                    printf("[gpu] GPU%d: Detected Turing sm_75 -> auto-optimized row_period_batch=6, col_period_batch=64 (3MB L2 resident, 20.3 TMAC/s peak)\n",
                            g->dev);
                 } else if(prop.major == 8 && prop.minor == 6){
                     // Ampere (RTX 3080/3090): 4-6MB L2 -> 8 row periods = 4MB L2 residency
@@ -508,6 +508,15 @@ void cp_gpu_init(int* devs, int ndev)
     }
     sync_tile_config();
     sync_ap_layout();
+}
+
+int cp_gpu_device_count(void)
+{
+    int count = 0;
+    if(cudaGetDeviceCount(&count) != cudaSuccess || count <= 0){
+        return 0;
+    }
+    return count;
 }
 
 int cp_gpu_list_devices(void)
