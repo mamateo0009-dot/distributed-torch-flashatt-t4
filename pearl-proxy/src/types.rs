@@ -152,6 +152,7 @@ pub struct EmbeddingRequest {
     pub user: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingItem {
     pub object: String,
@@ -159,12 +160,14 @@ pub struct EmbeddingItem {
     pub embedding: Vec<f32>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingUsage {
     pub prompt_tokens: u32,
     pub total_tokens: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingResponse {
     pub object: String,

@@ -24,3 +24,11 @@ flate2 = "1.0"
 base64 = "0.22"
 dashmap = "6.0"
 parking_lot = "0.12"
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = true

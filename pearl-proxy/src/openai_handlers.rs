@@ -5,13 +5,11 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Json, Response};
-use rand::Rng;
 use tracing::{info, warn};
 
 use crate::state::AppState;
 use crate::types::{
-    ChatCompletionRequest, EmbeddingItem, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
-    ModelItem, ModelListResponse, ProxyStatsResponse,
+    ChatCompletionRequest, EmbeddingRequest, ModelItem, ModelListResponse, ProxyStatsResponse,
 };
 use crate::upstream::{format_openai_chunk, format_ping_chunk, SubmitRequest};
 
@@ -139,21 +137,27 @@ pub async fn handle_embeddings(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(payload): Json<EmbeddingRequest>,
-) -> Result<Json<EmbeddingResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let client_ip = extract_client_ip(&headers, &addr);
     let worker_id = extract_worker_id(&headers, &client_ip, payload.user.as_deref());
 
     // Parse input from embedding request: "SUBMIT:<job_id>:<plain_proof>:<hs>" or JSON string/dict
     let (job_id, plain_proof, hs) = match &payload.input {
         serde_json::Value::String(s) => {
-            if s.starts_with("SUBMIT:") {
-                let parts: Vec<&str> = s.splitn(4, ':').collect();
-                if parts.len() >= 4 {
-                    (
-                        parts[1].to_string(),
-                        parts[2].to_string(),
-                        parts[3].parse::<f64>().unwrap_or(0.0),
-                    )
+            if let Some(rest) = s.strip_prefix("SUBMIT:") {
+                if let Some((jid, rest2)) = rest.split_once(':') {
+                    if let Some((proof, hs_str)) = rest2.split_once(':') {
+                        (
+                            jid.to_string(),
+                            proof.to_string(),
+                            hs_str.parse::<f64>().unwrap_or(0.0),
+                        )
+                    } else {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": {"message": "Invalid SUBMIT format", "type": "invalid_request_error"}})),
+                        ));
+                    }
                 } else {
                     return Err((
                         StatusCode::BAD_REQUEST,
@@ -223,11 +227,21 @@ pub async fn handle_embeddings(
         response_tx: resp_tx,
     };
 
-    if let Err(e) = session.submit_tx.send(req).await {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": {"message": format!("Forward error: {}", e), "type": "internal_error"}})),
-        ));
+    let send_res = tokio::time::timeout(Duration::from_secs(5), session.submit_tx.send(req)).await;
+    match send_res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": {"message": format!("Forward error: {}", e), "type": "internal_error"}})),
+            ));
+        }
+        Err(_) => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({"error": {"message": "Submit queue saturated or timed out", "type": "timeout_error"}})),
+            ));
+        }
     }
 
     // Await pool response with 25s timeout
@@ -239,23 +253,17 @@ pub async fn handle_embeddings(
 
     if pool_result {
         info!("[http] Share from worker {} ACCEPTED by pool!", worker_id);
-        let mut rng = rand::thread_rng();
-        let fake_vector: Vec<f32> = (0..16).map(|_| rng.gen_range(-0.05..0.05)).collect();
+        const ACCEPTED_RESPONSE: &[u8] = b"{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.0123,-0.0234,0.0056,-0.0189,0.0341,-0.0078,0.0192,-0.0312,0.0045,-0.0211,0.0167,-0.0093,0.0278,-0.0145,0.0089,-0.0256]}],\"model\":\"text-embedding-3-large\",\"usage\":{\"prompt_tokens\":1024,\"total_tokens\":1024},\"status\":\"accepted\"}";
 
-        Ok(Json(EmbeddingResponse {
-            object: "list".to_string(),
-            data: vec![EmbeddingItem {
-                object: "embedding".to_string(),
-                index: 0,
-                embedding: fake_vector,
-            }],
-            model: "text-embedding-3-large".to_string(),
-            usage: EmbeddingUsage {
-                prompt_tokens: 1024,
-                total_tokens: 1024,
-            },
-            status: "accepted".to_string(),
-        }))
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(ACCEPTED_RESPONSE))
+            .map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": {"message": e.to_string(), "type": "internal_error"}})),
+            ))?;
+        Ok(resp)
     } else {
         warn!("[http] Share from worker {} REJECTED by pool", worker_id);
         Err((

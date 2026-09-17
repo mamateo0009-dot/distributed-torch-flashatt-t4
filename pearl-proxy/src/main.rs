@@ -13,6 +13,9 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use crate::openai_handlers::{
     handle_admin_stats, handle_chat_completions, handle_dashboard_html, handle_embeddings,
     handle_health, handle_models_list,
@@ -127,7 +130,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
 
     let addr: SocketAddr = cli.listen.parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let socket = if addr.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    let _ = socket.set_reuseaddr(true);
+    socket.bind(addr)?;
+    let listener = socket.listen(4096)?;
     info!("[init] Proxy server listening on http://{}", addr);
     info!("[init] Live Web Dashboard available at http://{}/dashboard", addr);
 

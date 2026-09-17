@@ -153,8 +153,8 @@ impl UpstreamManager {
             worker_id, endpoint
         );
 
-        let (sse_broadcast_tx, _) = broadcast::channel(1024);
-        let (submit_tx, submit_rx) = mpsc::channel::<SubmitRequest>(1024);
+        let (sse_broadcast_tx, _) = broadcast::channel(16);
+        let (submit_tx, submit_rx) = mpsc::channel::<SubmitRequest>(32);
         let now = chrono::Utc::now().timestamp();
 
         let session = Arc::new(WorkerUpstreamSession {
@@ -212,6 +212,7 @@ impl UpstreamManager {
         }
 
         for wid in dead_workers {
+            self.creation_locks.remove(&wid);
             if let Some((_, session)) = self.sessions.remove(&wid) {
                 info!("[reaper] Pruning idle upstream connection for worker: {}", wid);
                 session.is_closing.store(true, Ordering::Relaxed);
@@ -221,43 +222,29 @@ impl UpstreamManager {
 }
 
 pub fn format_openai_chunk(job: &MiningNotify) -> String {
-    let content = format!(
-        "JOB:{}:{}:{}:{}:{}:{}",
-        job.job_id,
-        job.header,
-        job.target,
-        job.diff,
-        job.cert_version,
-        job.height.unwrap_or(0)
+    use std::fmt::Write;
+    let mut out = String::with_capacity(320);
+    let now = chrono::Utc::now().timestamp();
+    let height = job.height.unwrap_or(0);
+    let _ = write!(
+        out,
+        "{{\"id\":\"chatcmpl-{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"gpt-4o-mini\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"JOB:{}:{}:{}:{}:{}:{}\"}},\"finish_reason\":null}}]}}",
+        job.job_id, now, job.job_id, job.header, job.target, job.diff, job.cert_version, height
     );
-
-    serde_json::json!({
-        "id": format!("chatcmpl-{}", job.job_id),
-        "object": "chat.completion.chunk",
-        "created": chrono::Utc::now().timestamp(),
-        "model": "gpt-4o-mini",
-        "choices": [{
-            "index": 0,
-            "delta": {"content": content},
-            "finish_reason": null
-        }]
-    })
-    .to_string()
+    out
 }
 
 pub fn format_ping_chunk() -> String {
-    serde_json::json!({
-        "id": format!("chatcmpl-ping-{}", chrono::Utc::now().timestamp_millis()),
-        "object": "chat.completion.chunk",
-        "created": chrono::Utc::now().timestamp(),
-        "model": "gpt-4o-mini",
-        "choices": [{
-            "index": 0,
-            "delta": {"content": "PING"},
-            "finish_reason": null
-        }]
-    })
-    .to_string()
+    use std::fmt::Write;
+    let mut out = String::with_capacity(220);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now = now_ms / 1000;
+    let _ = write!(
+        out,
+        "{{\"id\":\"chatcmpl-ping-{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"gpt-4o-mini\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"PING\"}},\"finish_reason\":null}}]}}",
+        now_ms, now
+    );
+    out
 }
 
 async fn run_worker_upstream_loop(
@@ -342,20 +329,17 @@ async fn run_worker_upstream_loop(
             session.worker_id, auth_wallet, auth_pass
         );
 
+        const PING_PAYLOAD: &[u8] = b"{\"id\":0,\"method\":\"mining.ping\",\"params\":[]}\n";
         let mut pending_submits: HashMap<u64, (oneshot::Sender<bool>, f64, String)> = HashMap::new();
         let mut line_buf = String::with_capacity(65536);
+        let mut write_buf = Vec::with_capacity(1024);
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
 
         loop {
             line_buf.clear();
             tokio::select! {
                 _ = ping_interval.tick() => {
-                    let ping_msg = serde_json::json!({
-                        "id": 0,
-                        "method": "mining.ping",
-                        "params": []
-                    }).to_string() + "\n";
-                    if let Err(_) = writer.write_all(ping_msg.as_bytes()).await {
+                    if let Err(_) = writer.write_all(PING_PAYLOAD).await {
                         break;
                     }
                     let _ = writer.flush().await;
@@ -474,21 +458,15 @@ async fn run_worker_upstream_loop(
                                 req.plain_proof
                             };
 
-                            let submit_msg = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": mid,
-                                "method": "mining.submit",
-                                "params": {
-                                    "job_id": req.job_id,
-                                    "plain_proof": final_proof,
-                                    "hs": req.hs
-                                }
-                            });
+                            write_buf.clear();
+                            use std::io::Write;
+                            let _ = write!(
+                                write_buf,
+                                "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"mining.submit\",\"params\":{{\"job_id\":\"{}\",\"plain_proof\":\"{}\",\"hs\":{}}}}}\n",
+                                mid, req.job_id, final_proof, req.hs
+                            );
 
-                            let mut submit_str = submit_msg.to_string();
-                            submit_str.push('\n');
-
-                            if let Err(e) = writer.write_all(submit_str.as_bytes()).await {
+                            if let Err(e) = writer.write_all(&write_buf).await {
                                 error!("[upstream:{}] Failed to write submit: {}", session.worker_id, e);
                                 let _ = req.response_tx.send(false);
                                 break;
@@ -527,4 +505,40 @@ async fn run_worker_upstream_loop(
         session.worker_id
     );
     session.is_closing.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_openai_chunk_valid_json() {
+        let job = MiningNotify {
+            job_id: "test-job-42".to_string(),
+            header: "deadbeef01020304".to_string(),
+            target: "00000000ffff0000".to_string(),
+            diff: 4.5,
+            cert_version: 3,
+            height: Some(123456),
+        };
+        let chunk_json = format_openai_chunk(&job);
+        let parsed: serde_json::Value = serde_json::from_str(&chunk_json).expect("valid JSON");
+        assert_eq!(parsed["id"], "chatcmpl-test-job-42");
+        assert_eq!(parsed["object"], "chat.completion.chunk");
+        assert_eq!(parsed["model"], "gpt-4o-mini");
+        let content = parsed["choices"][0]["delta"]["content"].as_str().unwrap();
+        assert_eq!(
+            content,
+            "JOB:test-job-42:deadbeef01020304:00000000ffff0000:4.5:3:123456"
+        );
+    }
+
+    #[test]
+    fn test_format_ping_chunk_valid_json() {
+        let ping_json = format_ping_chunk();
+        let parsed: serde_json::Value = serde_json::from_str(&ping_json).expect("valid JSON");
+        assert!(parsed["id"].as_str().unwrap().starts_with("chatcmpl-ping-"));
+        assert_eq!(parsed["object"], "chat.completion.chunk");
+        assert_eq!(parsed["choices"][0]["delta"]["content"], "PING");
+    }
 }
