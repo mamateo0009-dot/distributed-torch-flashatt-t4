@@ -189,6 +189,16 @@ static int handle_notify_line(const char* line, int* msg_id, char* cur_job_key, 
     return rc;
 }
 
+static double extract_pool_difficulty(const char* line_buf)
+{
+    double d = cp_json_num(line_buf, "params");
+    if(d > 0.0) return d;
+    const char* p = strstr(line_buf, "\"params\":[");
+    if(!p) return 0.0;
+    p = strchr(p, '[');
+    return p ? atof(p + 1) : 0.0;
+}
+
 static int dispatch_main_pool_line(const char* line_buf, int* msg_id, char* cur_job_key, int* backoff_sec)
 {
     if(strstr(line_buf, "mining.notify")){
@@ -201,14 +211,7 @@ static int dispatch_main_pool_line(const char* line_buf, int* msg_id, char* cur_
     }
 
     if(strstr(line_buf, "mining.set_difficulty")){
-        double d = cp_json_num(line_buf, "params");
-        if(!d){
-            const char* p = strstr(line_buf, "\"params\":[");
-            if(p){
-                p = strchr(p, '[');
-                if(p) d = atof(p + 1);
-            }
-        }
+        double d = extract_pool_difficulty(line_buf);
         if(d > 0.0){
             cp_pool_set_difficulty(d);
             printf("[pool] mining.set_difficulty %.0f\n", d); fflush(stdout);
