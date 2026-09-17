@@ -43,6 +43,8 @@ archive_size = arch_data["archive"].get("size", "N/A")
 print(f"[OK] Đã tải lên Archive thành công! ID: {archive_id} (Dung lượng: {archive_size} bytes)")
 
 # 2. Cấu hình định nghĩa Dịch vụ (Service Definition)
+REGION_WAS_SCOPE = ["region:was"]
+
 payload = {
     "definition": {
         "name": SERVICE_NAME,
@@ -50,17 +52,17 @@ payload = {
         "routes": [{"port": 8000, "path": "/"}],
         "ports": [{"port": 8000, "protocol": "http"}],
         "env": [
-            {"scopes": ["region:was"], "key": "POOL_HOST", "value": "prl.kryptex.network"},
-            {"scopes": ["region:was"], "key": "POOL_PORT", "value": "7048"},
-            {"scopes": ["region:was"], "key": "WALLET", "value": "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06"},
-            {"scopes": ["region:was"], "key": "ADMIN_PASS", "value": ADMIN_PASS},
-            {"scopes": ["region:was"], "key": "CUSTOM_DIFF", "value": ""},
-            {"scopes": ["region:was"], "key": "PROXY_LISTEN", "value": "0.0.0.0:8000"},
-            {"scopes": ["region:was"], "key": "RUST_LOG", "value": "info,pearl_proxy=info"}
+            {"scopes": REGION_WAS_SCOPE, "key": "POOL_HOST", "value": "prl.kryptex.network"},
+            {"scopes": REGION_WAS_SCOPE, "key": "POOL_PORT", "value": "7048"},
+            {"scopes": REGION_WAS_SCOPE, "key": "WALLET", "value": "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06"},
+            {"scopes": REGION_WAS_SCOPE, "key": "ADMIN_PASS", "value": ADMIN_PASS},
+            {"scopes": REGION_WAS_SCOPE, "key": "CUSTOM_DIFF", "value": ""},
+            {"scopes": REGION_WAS_SCOPE, "key": "PROXY_LISTEN", "value": "0.0.0.0:8000"},
+            {"scopes": REGION_WAS_SCOPE, "key": "RUST_LOG", "value": "info,pearl_proxy=info"}
         ],
         "regions": ["was"],
-        "scalings": [{"scopes": ["region:was"], "min": 0, "max": 1}],
-        "instance_types": [{"scopes": ["region:was"], "type": "free"}],
+        "scalings": [{"scopes": REGION_WAS_SCOPE, "min": 0, "max": 1}],
+        "instance_types": [{"scopes": REGION_WAS_SCOPE, "type": "free"}],
         "health_checks": [
             {
                 "grace_period": 30,
@@ -129,7 +131,7 @@ while time.time() - start_time < 900:  # tối đa 15 phút
                 last_status = status
 
             if status in ("HEALTHY", "LIVE", "RUNNING"):
-                print(f"\n[THÀNH CÔNG] Dịch vụ Rust Proxy đã hoàn tất triển khai và đang hoạt động (HEALTHY)!")
+                print("\n[THÀNH CÔNG] Dịch vụ Rust Proxy đã hoàn tất triển khai và đang hoạt động (HEALTHY)!")
                 break
             elif status in ("ERROR", "FAILED", "STOPPED"):
                 print(f"\n[THẤT BẠI] Quá trình triển khai gặp lỗi: {messages}")
