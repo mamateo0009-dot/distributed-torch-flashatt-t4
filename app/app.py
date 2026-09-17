@@ -152,6 +152,16 @@ def handle_worker_client(client_sock, proxy_url, wallet, worker):
                 )
 
                 with urllib.request.urlopen(req, timeout=30) as resp:
+                    # Configure raw socket read timeout to prevent silent TCP hangs
+                    try:
+                        raw_sock = getattr(resp, 'fp', None)
+                        if raw_sock and hasattr(raw_sock, 'raw'):
+                            sock_obj = getattr(raw_sock.raw, '_sock', None)
+                            if sock_obj and hasattr(sock_obj, 'settimeout'):
+                                sock_obj.settimeout(25.0)
+                    except Exception:
+                        pass
+
                     for line in resp:
                         if stop_event.is_set():
                             break
@@ -277,7 +287,7 @@ def handle_worker_client(client_sock, proxy_url, wallet, worker):
                         try:
                             raw_proof_bytes = base64.b64decode(plain_proof)
                             if not (len(raw_proof_bytes) >= 2 and raw_proof_bytes[0] == 0x1F and raw_proof_bytes[1] == 0x8B):
-                                gz_bytes = zlib.compress(raw_proof_bytes, level=9, wbits=31)
+                                gz_bytes = zlib.compress(raw_proof_bytes, level=4, wbits=31)
                                 compressed_proof = base64.b64encode(gz_bytes).decode('ascii')
                         except Exception:
                             compressed_proof = plain_proof

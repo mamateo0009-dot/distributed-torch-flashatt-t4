@@ -129,8 +129,8 @@ impl UpstreamManager {
             }
         };
 
-        let (sse_broadcast_tx, _) = broadcast::channel(128);
-        let (submit_tx, submit_rx) = mpsc::channel::<SubmitRequest>(256);
+        let (sse_broadcast_tx, _) = broadcast::channel(1024);
+        let (submit_tx, submit_rx) = mpsc::channel::<SubmitRequest>(1024);
         let now = chrono::Utc::now().timestamp();
 
         let session = Arc::new(WorkerUpstreamSession {
