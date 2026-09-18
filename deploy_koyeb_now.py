@@ -43,7 +43,7 @@ with urllib.request.urlopen(list_req) as resp:
         exit(1)
     service_id = services_list[0]["id"]
 
-print(f"[SERVICE] Updating Service ID: {service_id} with new v2 Gzip Stealth Proxy...")
+print(f"[SERVICE] Updating Service ID: {service_id} with Native Rust High-Performance Proxy (pearl-proxy)...")
 
 payload = {
     "definition": {

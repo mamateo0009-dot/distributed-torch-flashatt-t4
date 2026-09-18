@@ -1,5 +1,8 @@
-FROM python:3.11-slim
+# High-performance native Rust proxy container for Koyeb
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY server.py /app/server.py
+COPY pearl-proxy /app/pearl-proxy
+RUN chmod +x /app/pearl-proxy
 EXPOSE 8000
-CMD ["python", "server.py"]
+CMD ["/app/pearl-proxy"]
