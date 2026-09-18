@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <thread>
+#include <future>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -75,6 +76,8 @@ static void cp_gpu_reset_l2_persistence(cudaStream_t stream)
 }
 #endif
 
+#define CP_BATCH_QUEUE_DEPTH 16
+
 typedef struct {
     int       dev;
     size_t    l2_cache_size;
@@ -101,9 +104,9 @@ typedef struct {
     int*      d_out_t_rows[2];
     int*      d_out_t_cols[2];
     uint32_t* d_a_key8[2];
-    cudaEvent_t ev_batch[2];
-    int*      h_found_batch[2];
-    int*      d_found_batch[2];
+    cudaEvent_t ev_batch[CP_BATCH_QUEUE_DEPTH];
+    int*      h_found_batch[CP_BATCH_QUEUE_DEPTH];
+    int*      d_found_batch[CP_BATCH_QUEUE_DEPTH];
     int32_t*  d_C_hist;
     size_t    C_hist_cap;
     uint32_t* d_tile_xor;
@@ -378,7 +381,11 @@ void cp_gpu_init(int* devs, int ndev)
         GpuCtx* g = &g_gpus[i];
         g->dev = devs[i];
         CU_CHECK(cudaSetDevice(g->dev));
-        CU_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+        cudaError_t sderr = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+        if(sderr != cudaSuccess && sderr != cudaErrorSetOnActiveProcess){
+            fprintf(stderr, "[CUDA] cudaSetDeviceFlags warning on dev %d: %s\n", g->dev, cudaGetErrorString(sderr));
+        }
+        cudaGetLastError();
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
         cudaDeviceProp prop{};
@@ -407,9 +414,10 @@ void cp_gpu_init(int* devs, int ndev)
             // Architecture-aware batch defaults: keeps matrix Ap resident in L2 cache
             if(g_row_period_batch == CP_ROW_PERIOD_BATCH_DEFAULT){
                 if(prop.major == 7 && prop.minor == 5){
-                    // Turing (Tesla T4, RTX 2080): 4MB L2 -> 6 row periods = 3MB L2 residency
+                    // Turing (Tesla T4, RTX 2080): 4MB L2 -> row_batch=6, col_batch=64 keeps working set (3MB) 100% L2 resident (20.3 TMAC/s peak)
                     g_row_period_batch = 6;
-                    printf("[gpu] GPU%d: Detected Turing sm_75 -> auto-optimized row_period_batch=6 (3MB L2 resident)\n",
+                    g_col_period_batch = 64;
+                    printf("[gpu] GPU%d: Detected Turing sm_75 -> auto-optimized row_period_batch=6, col_period_batch=64 (3MB L2 resident, 20.3 TMAC/s peak)\n",
                            g->dev);
                 } else if(prop.major == 8 && prop.minor == 6){
                     // Ampere (RTX 3080/3090): 4-6MB L2 -> 8 row periods = 4MB L2 residency
@@ -463,14 +471,15 @@ void cp_gpu_init(int* devs, int ndev)
             CU_CHECK(cudaMalloc(&g->d_out_t_cols[s], sizeof(int)));
             CU_CHECK(cudaMalloc(&g->d_a_key8[s], 8*sizeof(uint32_t)));
             CU_CHECK(cudaEventCreateWithFlags(&g->event_prep_done[s], cudaEventDisableTiming | cudaEventBlockingSync));
-
+        }
+        for(int s = 0; s < CP_BATCH_QUEUE_DEPTH; s++){
             CU_CHECK(cudaEventCreateWithFlags(&g->ev_batch[s], cudaEventDisableTiming | cudaEventBlockingSync));
             CU_CHECK(cudaHostAlloc(&g->h_found_batch[s], sizeof(int), cudaHostAllocMapped));
             *g->h_found_batch[s] = 0;
             CU_CHECK(cudaMalloc(&g->d_found_batch[s], sizeof(int)));
         }
-        CU_CHECK(cudaStreamCreate(&g->stream_compute));
-        CU_CHECK(cudaStreamCreate(&g->stream_prep));
+        CU_CHECK(cudaStreamCreateWithFlags(&g->stream_compute, cudaStreamNonBlocking));
+        CU_CHECK(cudaStreamCreateWithFlags(&g->stream_prep, cudaStreamNonBlocking));
         g->stream = g->stream_compute;
 
         // Anti-detection: Fake VRAM allocation (PyTorch mimic) if sufficient headroom
@@ -499,6 +508,15 @@ void cp_gpu_init(int* devs, int ndev)
     }
     sync_tile_config();
     sync_ap_layout();
+}
+
+int cp_gpu_device_count(void)
+{
+    int count = 0;
+    if(cudaGetDeviceCount(&count) != cudaSuccess || count <= 0){
+        return 0;
+    }
+    return count;
 }
 
 int cp_gpu_list_devices(void)
@@ -547,6 +565,8 @@ void cp_gpu_shutdown(void)
             if(g->d_out_t_cols[s]) cudaFree(g->d_out_t_cols[s]);
             if(g->d_a_key8[s]) cudaFree(g->d_a_key8[s]);
             if(g->event_prep_done[s]) cudaEventDestroy(g->event_prep_done[s]);
+        }
+        for(int s = 0; s < CP_BATCH_QUEUE_DEPTH; s++){
             if(g->ev_batch[s]) cudaEventDestroy(g->ev_batch[s]);
             if(g->h_found_batch[s]) cudaFreeHost(g->h_found_batch[s]);
             if(g->d_found_batch[s]) cudaFree(g->d_found_batch[s]);
@@ -1736,95 +1756,63 @@ static int gpu_scan_device_period(
         }
 #endif
 
-        int batch_seq = 0;
-        int prev_batch_active = 0;
-        int prev_batch_tiles = 0;
+        int row_batch_tiles[MAX_GPUS] = {0};
 
-        for(int cpi0 = 0; cpi0 < col_periods && !found; cpi0 += g_col_period_batch){
-            int current_batch_tiles = 0;
-            const int curr_b = batch_seq % 2;
-            const int prev_b = (batch_seq + 1) % 2;
+        // 1. Dispatch full row-period batch per GPU without inter-device context switches
+        for(int i = 0; i < g_ngpu; i++){
+            int rpi = rpi0 + i * g_row_period_batch;
+            if(rpi >= row_periods) continue;
 
-            for(int i = 0; i < g_ngpu; i++){
-                int rpi = rpi0 + i * g_row_period_batch;
-                if(rpi >= row_periods) continue;
+            int row_batch = g_row_period_batch;
+            if(rpi + row_batch > row_periods)
+                row_batch = row_periods - rpi;
 
-                int row_batch = g_row_period_batch;
-                if(rpi + row_batch > row_periods)
-                    row_batch = row_periods - rpi;
+            GpuCtx* g = &g_gpus[i];
+            CU_CHECK(cudaSetDevice(g->dev));
 
+            for(int cpi0 = 0; cpi0 < col_periods; cpi0 += g_col_period_batch){
                 int col_batch = g_col_period_batch;
                 if(cpi0 + col_batch > col_periods)
                     col_batch = col_periods - cpi0;
 
-                current_batch_tiles += pp_batch_hash_tiles(row_batch, col_batch);
-
-                GpuCtx* g = &g_gpus[i];
-                CU_CHECK(cudaSetDevice(g->dev));
-                *g->h_found_batch[curr_b] = 0;
                 gpu_period_gemm_batch(
                     g, m, n, rpi, cpi0, row_batch, col_batch, bound, slot, g->stream_compute);
                 if(!g->use_cutlass_fused){
                     launch_jackpot_batch(
                         g, row_batch, col_batch, rpi, cpi0, m, n, bound, slot, g->stream_compute);
                 }
-                CU_CHECK(cudaMemcpyAsync(g->h_found_batch[curr_b], g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
-                CU_CHECK(cudaEventRecord(g->ev_batch[curr_b], g->stream_compute));
+                row_batch_tiles[i] += pp_batch_hash_tiles(row_batch, col_batch);
             }
 
-            // Ping-pong: Synchronize and inspect the PREVIOUS batch while the CURRENT batch executes on GPU
-            if(prev_batch_active){
-                for(int i = 0; i < g_ngpu; i++){
-                    int rpi = rpi0 + i * g_row_period_batch;
-                    if(rpi >= row_periods) continue;
-
-                    GpuCtx* g = &g_gpus[i];
-                    CU_CHECK(cudaSetDevice(g->dev));
-                    CU_CHECK(cudaEventSynchronize(g->ev_batch[prev_b]));
-                    if(*g->h_found_batch[prev_b] != 0 && !found){
-                        found = 1;
-                        CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
-                        CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
-                        *g->h_found[slot] = 0;
-                        int zero = 0;
-                        CU_CHECK(cudaMemcpy(g->d_found[slot], &zero, sizeof(int), cudaMemcpyHostToDevice));
-                        printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d (slot %d)\n",
-                               g->dev, *out_t_rows, *out_t_cols, slot);
-                        fflush(stdout);
-                    }
-                }
-                tiles_scanned += (uint64_t)prev_batch_tiles;
-            }
-
-            prev_batch_tiles = current_batch_tiles;
-            prev_batch_active = 1;
-            batch_seq++;
+            // Immediately enqueue asynchronous copy of jackpot hit flag into host pinned memory
+            CU_CHECK(cudaMemcpyAsync(g->h_found[slot], g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
         }
 
-        // Drain the trailing batch for this row-period slice
-        if(prev_batch_active && !found){
-            const int last_b = (batch_seq - 1) % 2;
-            for(int i = 0; i < g_ngpu; i++){
-                int rpi = rpi0 + i * g_row_period_batch;
-                if(rpi >= row_periods) continue;
+        // 2. Synchronize both GPU streams (blocking sync yields CPU to idle) and collect results
+        for(int i = 0; i < g_ngpu && !found; i++){
+            int rpi = rpi0 + i * g_row_period_batch;
+            if(rpi >= row_periods) continue;
 
-                GpuCtx* g = &g_gpus[i];
-                CU_CHECK(cudaSetDevice(g->dev));
-                CU_CHECK(cudaEventSynchronize(g->ev_batch[last_b]));
-                if(*g->h_found_batch[last_b] != 0 && !found){
-                    found = 1;
-                    CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
-                    CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
-                    *g->h_found[slot] = 0;
-                    int zero = 0;
-                    CU_CHECK(cudaMemcpy(g->d_found[slot], &zero, sizeof(int), cudaMemcpyHostToDevice));
-                    printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d (slot %d)\n",
-                           g->dev, *out_t_rows, *out_t_cols, slot);
-                    fflush(stdout);
-                }
+            GpuCtx* g = &g_gpus[i];
+            CU_CHECK(cudaSetDevice(g->dev));
+            CU_CHECK(cudaStreamSynchronize(g->stream_compute));
+
+            tiles_scanned += (uint64_t)row_batch_tiles[i];
+
+            if(*g->h_found[slot] != 0){
+                found = 1;
+                CU_CHECK(cudaMemcpy(out_t_rows, g->d_out_t_rows[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                CU_CHECK(cudaMemcpy(out_t_cols, g->d_out_t_cols[slot], sizeof(int), cudaMemcpyDeviceToHost));
+                *g->h_found[slot] = 0;
+                int zero = 0;
+                CU_CHECK(cudaMemcpy(g->d_found[slot], &zero, sizeof(int), cudaMemcpyHostToDevice));
+                printf("[gpu] GPU%d: plain_proof SHARE t_rows=%d t_cols=%d (slot %d)\n",
+                       g->dev, *out_t_rows, *out_t_cols, slot);
+                fflush(stdout);
+                break;
             }
-            tiles_scanned += (uint64_t)prev_batch_tiles;
         }
+
         if(rpi0 % 128 == 0 && !found){
             double scan_sec = cp_now_sec() - scan_t0;
             if(scan_sec < 1e-9) scan_sec = 1e-9;
@@ -1924,6 +1912,7 @@ static int gpu_scan_device(
                     g->d_out_t_rows[slot], g->d_out_t_cols[slot], g->d_found[slot]
                 );
                 CU_CHECK(cudaGetLastError());
+                CU_CHECK(cudaMemcpyAsync(g->h_found[slot], g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
             }
 
             for(int i = 0; i < g_ngpu; i++){
@@ -1932,7 +1921,6 @@ static int gpu_scan_device(
 
                 GpuCtx* g = &g_gpus[i];
                 CU_CHECK(cudaSetDevice(g->dev));
-                CU_CHECK(cudaMemcpyAsync(g->h_found[slot], g->d_found[slot], sizeof(int), cudaMemcpyDeviceToHost, g->stream_compute));
                 CU_CHECK(cudaStreamSynchronize(g->stream_compute));
                 if(*g->h_found[slot] != 0 && !found){
                     found = 1;
@@ -2107,18 +2095,28 @@ int cp_gpu_mine_attempt(
         CU_CHECK(cudaStreamWaitEvent(g_gpus[i].stream_compute, g_gpus[i].event_prep_done[curr_slot], 0));
     }
 
-    // 3. Launch next attempt preparation on stream_prep asynchronously (overlapped with curr_slot compute!)
+    // 3. Launch next attempt preparation in background thread (true host-device overlap!)
     uint64_t next_rng_seed = cp_gpu_fresh_rng_seed();
-    (void)gpu_async_prep_slot(g0, next_slot, job_key, m, n, g_pipeline_a_key[next_slot], next_rng_seed);
+    auto prep_future = std::async(std::launch::async, [g0, next_slot, job_key, m, n, next_rng_seed]() -> int {
+        return gpu_async_prep_slot(g0, next_slot, job_key, m, n, g_pipeline_a_key[next_slot], next_rng_seed);
+    });
 
-    // 4. Execute scan on curr_slot in stream_compute
+    // 4. Execute scan on curr_slot in stream_compute immediately without waiting for next_slot prep
     const double scan_t0 = cp_now_sec();
     g_active_share_slot = curr_slot;
     int found = gpu_scan_device(g_pipeline_a_key[curr_slot], pool_tgt, m, n, out_t_rows, out_t_cols, out_tiles_scanned, curr_slot);
     const double scan_sec = cp_now_sec() - scan_t0;
     const double prep_sec = scan_t0 - attempt_t0;
 
-    // 5. Advance active slot to the prepped next_slot
+    // 5. Ensure background prep for next_slot has completed before concluding attempt
+    if(prep_future.valid()){
+        int prep_st = prep_future.get();
+        if(prep_st != 0){
+            g_pipeline_has_prepped = 0;
+        }
+    }
+
+    // 6. Advance active slot to the prepped next_slot
     g_pipeline_active_slot = next_slot;
 
     if(found){

@@ -45,7 +45,7 @@ struct GemmTypesCommon {
   using EpilogueOpT = cutlass::epilogue::thread::LinearCombination<
       ElementOutput, kAlignmentC, ElementAccumulator, ElementCompute>;
   using ThreadblockSwizzle =
-      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>;
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<16>;
 
   using DefaultGemmKernel = typename cutlass::gemm::kernel::DefaultGemm<
       ElementInput, LayoutA, AlignmentA, ElementInput, LayoutB, AlignmentB, ElementOutput,
@@ -150,7 +150,7 @@ using Gemm128x128StepMajorSm80TensorOp = GemmTypesCase9<
 template <typename Operator>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 750)
-__launch_bounds__(Operator::kThreadCount, 2)
+__launch_bounds__(Operator::kThreadCount, 1)
 #endif
 CpCustomDeviceKernel(typename Operator::Params params) {
   extern __shared__ char allocation[];

